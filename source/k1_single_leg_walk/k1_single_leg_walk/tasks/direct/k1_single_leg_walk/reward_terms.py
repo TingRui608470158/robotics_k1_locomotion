@@ -120,14 +120,26 @@ def alive_reward(num_envs: int, device: torch.device, scale: float) -> torch.Ten
 
 
 # --- 6. 軀幹姿態懲罰 ---
-def torso_orientation_penalty(torso_gravity_xy: torch.Tensor, scale: float) -> torch.Tensor:
-    """torso_gravity_xy: 軀幹重力在本體 xy 分量, shape (num_envs, 2)。"""
-    return torch.sum(torch.square(torso_gravity_xy), dim=1) * scale
+def torso_orientation_penalty(torso_gravity_xy, scale):
+    sin_tilt = torch.norm(torso_gravity_xy, dim=1).clamp(max=1.0)
+    tilt = torch.asin(sin_tilt)  # 弧度
+    return torch.square(tilt) * scale
 
 
 def ang_vel_xy_penalty(torso_ang_vel_xy: torch.Tensor, scale: float) -> torch.Tensor:
     """torso_ang_vel_xy: 軀幹角速度在本體 xy 分量, shape (num_envs, 2)。"""
     return torch.sum(torch.square(torso_ang_vel_xy), dim=1) * scale
+
+
+def torso_height_penalty(torso_height: torch.Tensor, target_height: float, scale: float) -> torch.Tensor:
+    """torso_height: 軀幹(root)世界座標 z, shape (num_envs,)。
+
+    torso_orientation_penalty 只管傾斜角度, 不管高度 —— 蹲低但軀幹依然直立時該項是 0。
+    這裡補上高度本身的追蹤, 讓「蹲低」在觸發 termination 之前就先有平滑的梯度懲罰,
+    而不是只靠 termination 這個硬門檻。target_height 建議設成單腳站立的自然高度
+    (可以印 default_root_state[:, 2] 來抓這個值), 不是 min_torso_height 那個摔倒門檻。
+    """
+    return torch.square(torso_height - target_height) * scale
 
 
 # --- 7. 動作變化率懲罰 ---

@@ -31,6 +31,7 @@ from .reward_terms import (
     joint_vel_penalty,
     lin_vel_tracking_reward,
     termination_penalty,
+    torso_height_penalty,
     torso_orientation_penalty,
 )
 
@@ -103,6 +104,7 @@ class K1SingleLegWalkEnv(DirectRLEnv):
                 "alive",
                 "torso_orientation",
                 "ang_vel_xy",
+                "torso_height",
                 "action_rate",
                 "joint_vel",
                 "joint_acc",
@@ -153,7 +155,7 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         # observation 回饋中溢位成 inf/nan（實際套用到物理的量已經有 max_delta clamp，
         # 這裡是保護原始值本身，跟 skrl_ppo_cfg.yaml 的 clip_actions 是兩道防線）
         self._actions = actions.clone().clamp(-10.0, 10.0)
-
+        # self._actions[:] = 0.0
         default_q = self.robot.data.default_joint_pos
 
         raw_delta = self._action_scale[self._controlled_idx] * self._actions
@@ -263,6 +265,9 @@ class K1SingleLegWalkEnv(DirectRLEnv):
                 torso_gravity_b[:, :2], self.cfg.torso_orientation_penalty_scale
             ),
             "ang_vel_xy": ang_vel_xy_penalty(torso_ang_vel_b[:, :2], self.cfg.ang_vel_xy_penalty_scale),
+            "torso_height": torso_height_penalty(
+                self.robot.data.root_state_w[:, 2], self.cfg.target_torso_height, self.cfg.torso_height_penalty_scale
+            ),
             "action_rate": action_rate_penalty(
                 self._actions, self._previous_actions, self.cfg.action_rate_penalty_scale
             ),
@@ -280,6 +285,7 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         # Logging
         for key, value in rewards.items():
             self._episode_sums[key] += value
+        # print(self.robot.data.default_root_state[:, 2])
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:

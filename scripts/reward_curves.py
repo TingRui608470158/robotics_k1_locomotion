@@ -45,16 +45,17 @@ DEFAULT_CFG = {
     # reward scales (7 大類)
     "lin_vel_tracking_reward_scale": 2.0,
     "ang_vel_tracking_reward_scale": 1.0,
-    "foot_height_reward_scale": 5.0,
-    "joint_deviation_penalty_scale": -0.1,
-    "feet_ori_penalty_scale": 0.0,
-    "close_feet_xy_penalty_scale": 0.0,
+    "foot_height_reward_scale": 3.0,
+    "joint_deviation_penalty_scale": -3.0,
+    "feet_ori_penalty_scale": -10.0,
+    "close_feet_xy_penalty_scale": -5.0,
     "feet_pitch_penalty_scale": 0.0,
     "alive_reward_scale": 1.0,
     "torso_orientation_penalty_scale": -3.0,
     "ang_vel_xy_penalty_scale": -1.0,
-    "action_rate_penalty_scale": -0.001,
-    "joint_vel_penalty_scale": -1e-3,
+    "torso_height_penalty_scale": -50.0,
+    "action_rate_penalty_scale": -0.01,
+    "joint_vel_penalty_scale": -0.01,
     "joint_acc_penalty_scale": 0.0,
     "termination_penalty_scale": -100.0,
     # kernel std / 目標值
@@ -63,7 +64,8 @@ DEFAULT_CFG = {
     "gait_tracking_sigma": 0.002,
     "close_feet_threshold": 0.15,
     "max_torso_tilt": 0.45,
-    "swing_height": 0.15,
+    "swing_height": 0.05,
+    "target_torso_height": 0.78,
     # pose_weights_map 的權重範圍(腿部最低 ~1.0, 手腕/肩/肘最高 5.0)
     "pose_weight_min": 1.0,
     "pose_weight_max": 5.0,
@@ -86,6 +88,7 @@ X_RANGE = {
     "action_rate": 3.0,  # 單一動作維度變化量
     "joint_vel": 10.0,  # rad/s, 單一關節
     "joint_acc": 200.0,  # rad/s^2, 單一關節
+    "torso_height": 0.3,  # m, 偏離 target_torso_height 的量
 }
 
 REWARD_COLOR = "#2a9d4a"
@@ -139,6 +142,8 @@ def term_curves(cfg: dict) -> dict[str, torch.Tensor]:
     joint_acc = torch.zeros(N, 1)
     joint_acc[:, 0] = X_NORM * X_RANGE["joint_acc"]
 
+    torso_height = cfg["target_torso_height"] + X_NORM * X_RANGE["torso_height"]
+
     return {
         "lin_vel": rt.lin_vel_tracking_reward(
             _ZEROS_N3, lin_vel, cfg["lin_vel_std"], cfg["lin_vel_tracking_reward_scale"]
@@ -168,6 +173,9 @@ def term_curves(cfg: dict) -> dict[str, torch.Tensor]:
         "action_rate": rt.action_rate_penalty(actions, previous_actions, cfg["action_rate_penalty_scale"]),
         "joint_vel": rt.joint_vel_penalty(joint_vel, controlled_idx, cfg["joint_vel_penalty_scale"]),
         "joint_acc": rt.joint_acc_penalty(joint_acc, controlled_idx, cfg["joint_acc_penalty_scale"]),
+        "torso_height": rt.torso_height_penalty(
+            torso_height, cfg["target_torso_height"], cfg["torso_height_penalty_scale"]
+        ),
     }
 
 
@@ -182,12 +190,13 @@ TERM_SCALE_KEY = {
     "alive": "alive_reward_scale",
     "torso_ori": "torso_orientation_penalty_scale",
     "ang_vel_xy": "ang_vel_xy_penalty_scale",
+    "torso_height": "torso_height_penalty_scale",
     "action_rate": "action_rate_penalty_scale",
     "joint_vel": "joint_vel_penalty_scale",
     "joint_acc": "joint_acc_penalty_scale",
 }
 
-# --- 建立圖表: 上方 4x4 為各項獨立公式形狀(14 格用到, 2 格留空), 最下面一整排是量級比較圖 ---
+# --- 建立圖表: 上方 4x4 為各項獨立公式形狀(15 格用到, 1 格留空), 最下面一整排是量級比較圖 ---
 curves0 = term_curves(DEFAULT_CFG)
 
 fig = plt.figure(figsize=(18, 24))
@@ -326,9 +335,18 @@ style_ax(
     "|joint_acc| (rad/s^2, single joint)",
 )
 
-# 剩下 3 格留空(4x4 格子共 16, 目前 13 條曲線 + 1 個峰值長條圖 = 14 格)
-for ax in (axes[3][1], axes[3][2]):
-    ax.axis("off")
+# ---------- 6c. 軀幹高度懲罰 ----------
+ax = axes[3][1]
+torso_height_x = X_NORM * X_RANGE["torso_height"]
+ax.plot(torso_height_x.numpy(), curves0["torso_height"].numpy(), color=PENALTY_COLOR)
+style_ax(
+    ax,
+    f"6c. Torso height penalty (scale={DEFAULT_CFG['torso_height_penalty_scale']})",
+    f"|height - target| (m, target={DEFAULT_CFG['target_torso_height']})",
+)
+
+# 剩下 1 格留空(4x4 格子共 16, 目前 14 條曲線 + 1 個峰值長條圖 = 15 格)
+axes[3][2].axis("off")
 
 # ---------- 各項峰值貢獻總覽(乘上 step_dt, 即單一 physics step 實際加減多少 reward) ----------
 ax = axes[3][3]
