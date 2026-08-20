@@ -13,6 +13,21 @@
 
 每個 *_reward / *_penalty 函式都回傳「已乘上 scale」的 (num_envs,) reward tensor,
 呼叫端(env.py 或 reward_curves.py)只需要再乘上 step_dt 做累加/畫圖。
+
+lin_vel_tracking_reward / ang_vel_tracking_reward / foot_height_tracking_reward /
+joint_deviation_penalty / feet_orientation_penalty / close_feet_xy_penalty /
+torso_orientation_penalty / ang_vel_xy_penalty / action_rate_penalty / alive_reward
+這 10 項的公式跟預設 scale 對齊 holosoma(../../holosoma)的 T1/G1 雙足 locomotion reward
+preset(見 holosoma/src/holosoma/holosoma/config_values/loco/{t1,g1}/reward.py 跟
+holosoma/src/holosoma/holosoma/managers/reward/terms/locomotion.py)。holosoma 的兩個
+preset 都沒有用到 termination_penalty / torso_height_penalty / joint_vel_penalty /
+joint_acc_penalty 這幾項(靠夠強的 orientation + action_rate 懲罰撐住,不是靠這些),
+所以這幾項在 env_cfg.py 裡預設 scale=0.0,函式留著但不是 holosoma baseline 的一部分。
+
+feet_orientation_penalty / close_feet_xy_penalty 這兩項「規定腳掌姿態細節」的懲罰在
+env_cfg.py 裡改成預設關閉, 參考 Revisiting Reward Design and Evaluation for Robust
+Humanoid Standing and Walking(arXiv:2404.19173)的論點: 過度規定性(overly prescriptive)
+的懲罰會一條一條砍掉可行解空間, policy 可能被逼到只剩奇怪姿勢能同時滿足所有規定。
 """
 
 from __future__ import annotations
@@ -24,11 +39,6 @@ import torch
 def exp_kernel(error_sq: torch.Tensor, std: float) -> torch.Tensor:
     """速度追蹤 / 腳掌高度追蹤共用的指數核: exp(-error_sq / std)。"""
     return torch.exp(-error_sq / std)
-
-
-def hinge_penalty(threshold: float, value: torch.Tensor) -> torch.Tensor:
-    """腳掌間距過近懲罰: clamp(threshold - value, min=0)。"""
-    return torch.clamp(threshold - value, min=0.0)
 
 
 def expected_foot_height(phi: torch.Tensor, swing_height: float) -> torch.Tensor:
@@ -99,19 +109,19 @@ def joint_deviation_penalty(
     return torch.sum(weighted_pose_error, dim=1) * scale
 
 
-# --- 4. 腳掌相關懲罰 ---
-def feet_orientation_penalty(feet_yaw_diff: torch.Tensor, scale: float) -> torch.Tensor:
-    """feet_yaw_diff: 已 wrap 到 [-pi, pi] 的左右腳 yaw 差, shape (num_envs,)。"""
-    return torch.square(feet_yaw_diff) * scale
+# --- 4. 腳掌相關懲罰(參考 holosoma penalty_feet_ori / penalty_close_feet_xy) ---
+def feet_orientation_penalty(feet_gravity_xy: torch.Tensor, scale: float) -> torch.Tensor:
+    """量測腳掌相對地面的平整度(pitch+roll), 不是左右腳 yaw 差。
+
+    feet_gravity_xy: 左右腳重力在各自本體座標的 xy 分量, shape (num_envs, 2 feet, 2)。
+    每隻腳先取 xy 分量的 norm(~sin(傾斜角)), 兩腳相加。
+    """
+    return torch.sum(torch.norm(feet_gravity_xy, dim=-1), dim=-1) * scale
 
 
 def close_feet_xy_penalty(feet_lateral: torch.Tensor, threshold: float, scale: float) -> torch.Tensor:
-    return hinge_penalty(threshold, feet_lateral) * scale
-
-
-def feet_pitch_penalty(feet_gravity_x: torch.Tensor, scale: float) -> torch.Tensor:
-    """feet_gravity_x: 左右腳重力在本體 x 分量(~sin(pitch)), shape (num_envs, 2)。"""
-    return torch.sum(torch.square(feet_gravity_x), dim=1) * scale
+    """腳掌側向間距小於 threshold 時固定懲罰(二元, 非連續斜坡)。"""
+    return (feet_lateral < threshold).float() * scale
 
 
 # --- 5. 存活獎勵 ---
@@ -119,11 +129,10 @@ def alive_reward(num_envs: int, device: torch.device, scale: float) -> torch.Ten
     return torch.ones(num_envs, device=device) * scale
 
 
-# --- 6. 軀幹姿態懲罰 ---
-def torso_orientation_penalty(torso_gravity_xy, scale):
-    sin_tilt = torch.norm(torso_gravity_xy, dim=1).clamp(max=1.0)
-    tilt = torch.asin(sin_tilt)  # 弧度
-    return torch.square(tilt) * scale
+# --- 6. 軀幹姿態懲罰(參考 holosoma penalty_orientation) ---
+def torso_orientation_penalty(torso_gravity_xy: torch.Tensor, scale: float) -> torch.Tensor:
+    """torso_gravity_xy: 軀幹重力在本體 xy 分量, shape (num_envs, 2)。"""
+    return torch.sum(torch.square(torso_gravity_xy), dim=1) * scale
 
 
 def ang_vel_xy_penalty(torso_ang_vel_xy: torch.Tensor, scale: float) -> torch.Tensor:

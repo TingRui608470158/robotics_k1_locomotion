@@ -24,7 +24,6 @@ from .reward_terms import (
     ang_vel_xy_penalty,
     close_feet_xy_penalty,
     feet_orientation_penalty,
-    feet_pitch_penalty,
     foot_height_tracking_reward,
     joint_acc_penalty,
     joint_deviation_penalty,
@@ -100,7 +99,6 @@ class K1SingleLegWalkEnv(DirectRLEnv):
                 "joint_deviation",
                 "feet_ori",
                 "close_feet_xy",
-                "feet_pitch",
                 "alive",
                 "torso_orientation",
                 "ang_vel_xy",
@@ -203,12 +201,6 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         feet_quat = self.robot.data.body_quat_w[:, self._ankle_ids]  # (N, 2, 4)
         feet_quat_flat = feet_quat.reshape(-1, 4)  # (N*2, 4)
 
-        # 左右腳 yaw 差, wrap 到 [-pi, pi]
-        _, _, feet_yaw = euler_xyz_from_quat(feet_quat_flat)
-        feet_yaw = feet_yaw.reshape(self.num_envs, 2)
-        raw_yaw_diff = feet_yaw[:, 0] - feet_yaw[:, 1]
-        feet_yaw_diff = torch.atan2(torch.sin(raw_yaw_diff), torch.cos(raw_yaw_diff))
-
         # 左右腳側向間距(投影到軀幹 y 軸)
         _, _, base_yaw = euler_xyz_from_quat(self.robot.data.root_quat_w)
         cos_y, sin_y = torch.cos(base_yaw), torch.sin(base_yaw)
@@ -255,11 +247,10 @@ class K1SingleLegWalkEnv(DirectRLEnv):
                 self._pose_weights,
                 self.cfg.joint_deviation_penalty_scale,
             ),
-            "feet_ori": feet_orientation_penalty(feet_yaw_diff, self.cfg.feet_ori_penalty_scale),
+            "feet_ori": feet_orientation_penalty(feet_gravity_b[:, :, :2], self.cfg.feet_ori_penalty_scale),
             "close_feet_xy": close_feet_xy_penalty(
                 feet_lateral, self.cfg.close_feet_threshold, self.cfg.close_feet_xy_penalty_scale
             ),
-            "feet_pitch": feet_pitch_penalty(feet_gravity_b[:, :, 0], self.cfg.feet_pitch_penalty_scale),
             "alive": alive_reward(self.num_envs, self.device, self.cfg.alive_reward_scale),
             "torso_orientation": torso_orientation_penalty(
                 torso_gravity_b[:, :2], self.cfg.torso_orientation_penalty_scale
@@ -285,7 +276,6 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         # Logging
         for key, value in rewards.items():
             self._episode_sums[key] += value
-        # print(self.robot.data.default_root_state[:, 2])
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:

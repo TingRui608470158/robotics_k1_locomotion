@@ -42,33 +42,32 @@ rt = _load_reward_terms()
 
 # --- 對應 k1_single_leg_walk_env_cfg.py 的預設值 ---
 DEFAULT_CFG = {
-    # reward scales (7 大類)
+    # reward scales(10 項對齊 holosoma T1/G1 preset, 其餘 4 項是額外選配, 預設關閉)
     "lin_vel_tracking_reward_scale": 2.0,
-    "ang_vel_tracking_reward_scale": 1.0,
-    "foot_height_reward_scale": 3.0,
-    "joint_deviation_penalty_scale": -3.0,
-    "feet_ori_penalty_scale": -10.0,
-    "close_feet_xy_penalty_scale": -5.0,
-    "feet_pitch_penalty_scale": 0.0,
+    "ang_vel_tracking_reward_scale": 1.5,
+    "foot_height_reward_scale": 5.0,
+    "joint_deviation_penalty_scale": -0.5,
+    "feet_ori_penalty_scale": 0.0,
+    "close_feet_xy_penalty_scale": 0.0,
     "alive_reward_scale": 1.0,
-    "torso_orientation_penalty_scale": -3.0,
+    "torso_orientation_penalty_scale": -10.0,
     "ang_vel_xy_penalty_scale": -1.0,
-    "torso_height_penalty_scale": -50.0,
-    "action_rate_penalty_scale": -0.01,
-    "joint_vel_penalty_scale": -0.01,
+    "action_rate_penalty_scale": -2.0,
+    "torso_height_penalty_scale": 0.0,
+    "joint_vel_penalty_scale": 0.0,
     "joint_acc_penalty_scale": 0.0,
-    "termination_penalty_scale": -100.0,
+    "termination_penalty_scale": 0.0,
     # kernel std / 目標值
     "lin_vel_std": 0.25,
     "ang_vel_std": 0.25,
-    "gait_tracking_sigma": 0.002,
+    "gait_tracking_sigma": 0.008,
     "close_feet_threshold": 0.15,
     "max_torso_tilt": 0.45,
-    "swing_height": 0.05,
+    "swing_height": 0.09,
     "target_torso_height": 0.78,
-    # pose_weights_map 的權重範圍(腿部最低 ~1.0, 手腕/肩/肘最高 5.0)
-    "pose_weight_min": 1.0,
-    "pose_weight_max": 5.0,
+    # pose_weights_map 的權重範圍(knee 最低 0.2, 腰部以上最高 50.0)
+    "pose_weight_min": 0.2,
+    "pose_weight_max": 50.0,
     # step_dt = decimation * sim_dt = 2 * (1/200)
     "step_dt": 2 * (1 / 200),
 }
@@ -79,9 +78,8 @@ X_RANGE = {
     "ang_vel": 3.0,  # rad/s
     "foot_height": 0.05,  # m
     "joint_dev(max)": 1.0,  # rad
-    "feet_ori": torch.pi / 2,  # rad
+    "feet_ori": 1.0,  # sin(單腳傾角), 對稱, 取 [0,1] 代表
     "close_feet": 0.3,  # m
-    "feet_pitch": 1.0,  # sin(pitch), 對稱, 取 [0,1] 代表
     "alive": 1.0,  # 常數項, x 軸無意義
     "torso_ori": DEFAULT_CFG["max_torso_tilt"] * 1.5,  # rad
     "ang_vel_xy": 5.0,  # rad/s
@@ -123,8 +121,9 @@ def term_curves(cfg: dict) -> dict[str, torch.Tensor]:
 
     feet_lateral = X_NORM * X_RANGE["close_feet"]
 
-    feet_gravity_x = torch.zeros(N, 2)
-    feet_gravity_x[:, 0] = X_NORM * X_RANGE["feet_pitch"]
+    # 只讓其中一隻腳的 x 分量偏離 0(單腳傾斜), 另一隻腳跟 y 分量維持 0
+    feet_gravity_xy = torch.zeros(N, 2, 2)
+    feet_gravity_xy[:, 0, 0] = X_NORM * X_RANGE["feet_ori"]
 
     torso_gravity_xy = torch.zeros(N, 2)
     torso_gravity_xy[:, 0] = torch.sin(X_NORM * X_RANGE["torso_ori"])
@@ -162,11 +161,10 @@ def term_curves(cfg: dict) -> dict[str, torch.Tensor]:
         "joint_dev(max)": rt.joint_deviation_penalty(
             joint_pos, default_joint_pos, controlled_idx, pose_weight_max, cfg["joint_deviation_penalty_scale"]
         ),
-        "feet_ori": rt.feet_orientation_penalty(X_NORM * X_RANGE["feet_ori"], cfg["feet_ori_penalty_scale"]),
+        "feet_ori": rt.feet_orientation_penalty(feet_gravity_xy, cfg["feet_ori_penalty_scale"]),
         "close_feet": rt.close_feet_xy_penalty(
             feet_lateral, cfg["close_feet_threshold"], cfg["close_feet_xy_penalty_scale"]
         ),
-        "feet_pitch": rt.feet_pitch_penalty(feet_gravity_x, cfg["feet_pitch_penalty_scale"]),
         "alive": rt.alive_reward(N, torch.device("cpu"), cfg["alive_reward_scale"]),
         "torso_ori": rt.torso_orientation_penalty(torso_gravity_xy, cfg["torso_orientation_penalty_scale"]),
         "ang_vel_xy": rt.ang_vel_xy_penalty(torso_ang_vel_xy, cfg["ang_vel_xy_penalty_scale"]),
@@ -186,7 +184,6 @@ TERM_SCALE_KEY = {
     "joint_dev(max)": "joint_deviation_penalty_scale",
     "feet_ori": "feet_ori_penalty_scale",
     "close_feet": "close_feet_xy_penalty_scale",
-    "feet_pitch": "feet_pitch_penalty_scale",
     "alive": "alive_reward_scale",
     "torso_ori": "torso_orientation_penalty_scale",
     "ang_vel_xy": "ang_vel_xy_penalty_scale",
@@ -196,7 +193,7 @@ TERM_SCALE_KEY = {
     "joint_acc": "joint_acc_penalty_scale",
 }
 
-# --- 建立圖表: 上方 4x4 為各項獨立公式形狀(15 格用到, 1 格留空), 最下面一整排是量級比較圖 ---
+# --- 建立圖表: 上方 4x4 為各項獨立公式形狀(14 格用到, 2 格留空), 最下面一整排是量級比較圖 ---
 curves0 = term_curves(DEFAULT_CFG)
 
 fig = plt.figure(figsize=(18, 24))
@@ -265,11 +262,13 @@ style_ax(
 )
 ax.legend(fontsize=6, loc="lower left")
 
-# ---------- 4a. 腳掌朝向懲罰 ----------
+# ---------- 4a. 腳掌平整度懲罰(pitch+roll, 非左右腳 yaw 差) ----------
 ax = axes[1][0]
-yaw_diff = X_NORM * X_RANGE["feet_ori"]
-ax.plot(yaw_diff.numpy(), curves0["feet_ori"].numpy(), color=PENALTY_COLOR)
-style_ax(ax, f"4a. Feet orientation penalty (scale={DEFAULT_CFG['feet_ori_penalty_scale']})", "L/R feet yaw diff (rad)")
+feet_tilt = X_NORM * X_RANGE["feet_ori"]
+ax.plot(feet_tilt.numpy(), curves0["feet_ori"].numpy(), color=PENALTY_COLOR)
+style_ax(
+    ax, f"4a. Feet orientation penalty (scale={DEFAULT_CFG['feet_ori_penalty_scale']})", "single foot tilt, sin(angle)"
+)
 
 # ---------- 4b. 腳掌間距過近懲罰 ----------
 ax = axes[1][1]
@@ -280,11 +279,8 @@ style_ax(
     ax, f"4b. Close feet penalty (scale={DEFAULT_CFG['close_feet_xy_penalty_scale']})", "feet lateral distance (m)"
 )
 
-# ---------- 4c. 腳掌平行懲罰 ----------
-ax = axes[1][2]
-feet_pitch = X_NORM * X_RANGE["feet_pitch"]
-ax.plot(feet_pitch.numpy(), curves0["feet_pitch"].numpy(), color=PENALTY_COLOR)
-style_ax(ax, f"4c. Feet pitch penalty (scale={DEFAULT_CFG['feet_pitch_penalty_scale']})", "|sin(feet pitch)|")
+# 4c 已併入 4a(holosoma penalty_feet_ori 一次涵蓋 pitch+roll), 這格留空
+axes[1][2].axis("off")
 
 # ---------- 5. 存活獎勵 ----------
 ax = axes[1][3]
@@ -345,7 +341,7 @@ style_ax(
     f"|height - target| (m, target={DEFAULT_CFG['target_torso_height']})",
 )
 
-# 剩下 1 格留空(4x4 格子共 16, 目前 14 條曲線 + 1 個峰值長條圖 = 15 格)
+# 剩下 1 格留空(4x4 格子共 16, 目前 13 條曲線 + 1 個峰值長條圖 = 14 格)
 axes[3][2].axis("off")
 
 # ---------- 各項峰值貢獻總覽(乘上 step_dt, 即單一 physics step 實際加減多少 reward) ----------
