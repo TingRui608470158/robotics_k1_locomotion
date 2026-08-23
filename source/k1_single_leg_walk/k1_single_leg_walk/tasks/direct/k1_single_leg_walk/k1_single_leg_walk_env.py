@@ -136,12 +136,6 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         self._prev_foot_in_contact = torch.ones(self.num_envs, 2, dtype=torch.bool, device=self.device)
         self._foot_air_time = torch.zeros(self.num_envs, 2, device=self.device)
 
-        # contact_height_threshold 課程式訓練狀態(全體共用一個純量, 不是每個 env 各自的):
-        # 把 curriculum_total_timesteps 切成 3 等分, 每過 1/3 晉級一次, 依序套用
-        # contact_height_threshold_stages 三個值。見 env_cfg.py 的說明跟
-        # _update_contact_height_curriculum()。
-        self._contact_height_threshold = self.cfg.contact_height_threshold_stages[0]
-
         # 軀幹線速度上一步的值, 用有限差分算 base_acceleration_reward(論文公式只看線加速度)
         self._prev_lin_vel_b = torch.zeros(self.num_envs, 3, device=self.device)
 
@@ -320,19 +314,7 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         observations = {"policy": obs}
         return observations
 
-    def _update_contact_height_curriculum(self) -> None:
-        """把 curriculum_total_timesteps 切成 3 等分, 每過 1/3 就晉級一次
-        contact_height_threshold(依序套用 contact_height_threshold_stages 三個值), 不看
-        表現、只看訓練進度 —— 簡單版課程, 見 env_cfg.py 的說明。
-        """
-        stages = self.cfg.contact_height_threshold_stages
-        progress = self.common_step_counter / max(1, self.cfg.curriculum_total_timesteps)
-        stage_idx = min(int(progress * 3), len(stages) - 1)
-        self._contact_height_threshold = stages[stage_idx]
-
     def _get_rewards(self) -> torch.Tensor:
-        self._update_contact_height_curriculum()
-
         base_quat = self.robot.data.root_quat_w
         base_yaw = yaw_from_quat(base_quat)
         lin_vel_b = self.robot.data.root_lin_vel_b
@@ -356,7 +338,7 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         # 事實上的最低抬腳高度要求, 見 __init__ 裡的說明。
         feet_z = self.robot.data.body_pos_w[:, self._feet_ids, 2]  # (N, 2)
         ground_clearance = feet_z - self.cfg.origin_height
-        foot_in_contact = ground_clearance < self._contact_height_threshold  # (N, 2)
+        foot_in_contact = ground_clearance < self.cfg.contact_height_threshold  # (N, 2)
         self._last_foot_in_contact = foot_in_contact
 
         single_contact_now = torch.sum(foot_in_contact, dim=1) == 1
@@ -553,5 +535,4 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         # plain python int/float values here get silently dropped (no error, just never shows up)
         extras["Episode_Termination/base_contact"] = torch.count_nonzero(self.reset_terminated[env_ids]).float()
         extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids]).float()
-        extras["Curriculum/contact_height_threshold"] = torch.tensor(self._contact_height_threshold, device=self.device)
         self.extras["log"].update(extras)

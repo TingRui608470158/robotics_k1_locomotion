@@ -132,9 +132,9 @@ class K1SingleLegWalkEnvCfg(DirectRLEnvCfg):
     # 施加在骨盆(pelvis, articulation 的 root body)上, 只持續這一個 step(=論文的 20ms,
     # 剛好等於我們現在 decimation=40、sim.dt=1/2000 算出來的 step_dt)。
     #
-    # enable_random_push 預設 True(訓練用); play.py/keyboard_play.py 會在建立環境前把它
-    # 設成 False, 不然 play/測試時機器人會被無預警亂推, 看起來像「沒下指令自己亂動」。
-    enable_random_push: bool = True
+    # 先關掉(預設 False): 目前正在追查腳踝晃動這個問題, 想先排除隨機推力這個變因、
+    # 回到沒有外力干擾的版本。機制還在, 之後想重新打開只要把這裡改回 True。
+    enable_random_push: bool = False
     random_push_prob: float = 0.01
     min_push_force: float = 200.0  # N
     max_push_force: float = 800.0  # N
@@ -166,19 +166,8 @@ class K1SingleLegWalkEnvCfg(DirectRLEnvCfg):
     # 是可靠的接觸替代量測。
     single_foot_contact_reward_scale: float = 0.1
     origin_height: float = 0.065  # m, 腳踝(ankle_roll_link)原點到腳底的偏移量
+    contact_height_threshold: float = 0.03  # m, 淨離地高度低於此值算著地(=最低抬腳高度要求)
     single_contact_grace_period: float = 0.2  # s, 過去這段時間內只要出現過單腳著地就算數
-
-    # contact_height_threshold 課程式訓練(簡化版, 純看訓練進度、不看表現): 把
-    # curriculum_total_timesteps 這整段訓練切成 3 等分, 每過 1/3 就晉級一次門檻, 依序套用
-    # contact_height_threshold_stages 這三個值(第一等分用 [0], 第二等分用 [1], 最後一等分
-    # 用 [2])。不是一開始就固定用最終目標值硬練 —— 實測直接固定在 0.05~0.08 會讓
-    # single_foot_contact 學不起來, 太嚴的門檻在 policy 還不會踏步的階段等於完全沒有梯度
-    # 可以爬。curriculum_total_timesteps 要自己對齊實際打算訓練的總步數(例如 skrl
-    # --max_iterations * rollouts, 或直接抓 train.py 印出來的總 timesteps), 這裡沒辦法
-    # 自動讀到 agent 端的設定。目前的課程階段存在 K1SingleLegWalkEnv._contact_height_threshold
-    # (不是 cfg 常數, 見 env.py 的 _update_contact_height_curriculum())。
-    contact_height_threshold_stages: tuple[float, float, float] = (0.02, 0.04, 0.06)  # m
-    curriculum_total_timesteps: int = 300_000
 
     # 2b. 兩腳角色對稱(不在論文原文裡, 是補的): single_foot_contact 只看「恰好一隻腳著地」,
     # 不管是哪隻腳, 訓練中發現 policy 會鑽漏洞 —— 固定一腳整場貼地拖著走、另一腳負責所有
