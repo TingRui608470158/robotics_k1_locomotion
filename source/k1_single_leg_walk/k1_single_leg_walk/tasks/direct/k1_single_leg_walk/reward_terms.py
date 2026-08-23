@@ -3,31 +3,32 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""K1 single-leg-walk 的每一項 reward/penalty 公式(含 scale)。
+"""K1 single-leg-walk 的每一項 reward 公式(含 scale)。
 
 只吃/回傳 torch.Tensor 或純量, 只依賴 torch, 不 import 這個套件裡任何其他模組
 (尤其不 import isaaclab, 這樣才能被 scripts/reward_curves.py 用 importlib 直接以
-檔案路徑載入, 不需要 Isaac Sim)。四元數 -> 純量(yaw 差、重力投影分量等)的轉換屬於
-「讀取機器人狀態」, 留在 k1_single_leg_walk_env.py; 這裡只放「純量狀態 -> reward」
-的公式本身, 這樣 _get_rewards() 就只需要組出輸入、呼叫這裡的函式。
+檔案路徑載入, 不需要 Isaac Sim)。四元數 -> 純量的轉換(取 body 姿態、算重力投影等)
+屬於「讀取機器人狀態」, 留在 k1_single_leg_walk_env.py; 這裡只放「純量/tensor 狀態
+-> reward」的公式本身。
 
-每個 *_reward / *_penalty 函式都回傳「已乘上 scale」的 (num_envs,) reward tensor,
-呼叫端(env.py 或 reward_curves.py)只需要再乘上 step_dt 做累加/畫圖。
+整套 reward 架構對齊 Revisiting Reward Design and Evaluation for Robust Humanoid
+Standing and Walking(arXiv:2404.19173)的 Reward Term Definition/Weighting 表格,
+逐項數字/公式都照論文原文抄, 不是本專案自己抓的起點:
 
-lin_vel_tracking_reward / ang_vel_tracking_reward / foot_height_tracking_reward /
-joint_deviation_penalty / feet_orientation_penalty / close_feet_xy_penalty /
-torso_orientation_penalty / ang_vel_xy_penalty / action_rate_penalty / alive_reward
-這 10 項的公式跟預設 scale 對齊 holosoma(../../holosoma)的 T1/G1 雙足 locomotion reward
-preset(見 holosoma/src/holosoma/holosoma/config_values/loco/{t1,g1}/reward.py 跟
-holosoma/src/holosoma/holosoma/managers/reward/terms/locomotion.py)。holosoma 的兩個
-preset 都沒有用到 termination_penalty / torso_height_penalty / joint_vel_penalty /
-joint_acc_penalty 這幾項(靠夠強的 orientation + action_rate 懲罰撐住,不是靠這些),
-所以這幾項在 env_cfg.py 裡預設 scale=0.0,函式留著但不是 holosoma baseline 的一部分。
+1. 三項核心指令追蹤(xy 速度、yaw 朝向、roll/pitch 朝向) —— 論文指出只用這三項會學出
+   雙腳同時跳躍前進的怪異步態(滿足指令但不是想要的走路方式)。
+2. 單腳接觸(single foot contact) —— 論文比較五種抑制跳躍步態的方法後, 認為這項最可靠
+   也最不限制行為, 取代舊版以相位時鐘追蹤腳掌高度曲線的做法。
+3. 風格 / sim-to-real 輔助項(base height、feet air time、feet orientation、
+   feet position、arm、base acceleration、action difference、torque)。
 
-feet_orientation_penalty / close_feet_xy_penalty 這兩項「規定腳掌姿態細節」的懲罰在
-env_cfg.py 裡改成預設關閉, 參考 Revisiting Reward Design and Evaluation for Robust
-Humanoid Standing and Walking(arXiv:2404.19173)的論點: 過度規定性(overly prescriptive)
-的懲罰會一條一條砍掉可行解空間, policy 可能被逼到只剩奇怪姿勢能同時滿足所有規定。
+論文表格裡的規律: 大多數輔助項用的是「絕對值/範數誤差」(線性), 不是「誤差平方」;
+而且好幾項(feet air time、feet position、feet orientation)在站立/不轉彎以外的情況
+是給「固定 1 分」而不是「關掉(=0)」——這兩點都跟舊版(本檔案作者自己抓起點時)的做法
+不同, 這次改版已經全部照論文改掉。
+
+唯一例外: feet_orientation 的核函數係數在原始 OCR 掃描裡缺字看不清楚, 沿用之前抓的
+5.0 當佔位數字, 不是論文原文確切數字, 訓練時可能需要再調。
 """
 
 from __future__ import annotations
@@ -35,136 +36,222 @@ from __future__ import annotations
 import torch
 
 
-# --- 共用數學核心 ---
-def exp_kernel(error_sq: torch.Tensor, std: float) -> torch.Tensor:
-    """速度追蹤 / 腳掌高度追蹤共用的指數核: exp(-error_sq / std)。"""
-    return torch.exp(-error_sq / std)
+# --- 四元數工具(w, x, y, z 慣例, 對齊 isaaclab 的 quat 慣例) ---
+def quat_mul(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    w1, x1, y1, z1 = q1.unbind(-1)
+    w2, x2, y2, z2 = q2.unbind(-1)
+    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+    return torch.stack([w, x, y, z], dim=-1)
 
 
-def expected_foot_height(phi: torch.Tensor, swing_height: float) -> torch.Tensor:
-    """Expected foot height from gait phase using a cubic Bézier swing/stance profile."""
-
-    def cubic_bezier_interpolation(y_start: torch.Tensor, y_end: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        y_diff = y_end - y_start
-        bezier = x**3 + 3 * (x**2 * (1 - x))
-        return y_start + y_diff * bezier
-
-    x = (phi + torch.pi) / (2 * torch.pi)  # [0, 1)
-
-    # 前半週期: 真正的支撐期, 高度固定為 0
-    stance = torch.zeros_like(x)
-
-    # 後半週期: 單獨在這半段裡完成「上升 -> 下降」的完整弧線
-    t = torch.clamp((x - 0.5) * 2, 0.0, 1.0)  # 把 [0.5, 1) 重新縮放成 [0, 1]
-    rising = cubic_bezier_interpolation(torch.zeros_like(t), torch.full_like(t, swing_height), 2 * t)
-    falling = cubic_bezier_interpolation(torch.full_like(t, swing_height), torch.zeros_like(t), 2 * t - 1)
-    swing = torch.where(t <= 0.5, rising, falling)
-
-    return torch.where(x <= 0.5, stance, swing)
+def quat_conjugate(q: torch.Tensor) -> torch.Tensor:
+    w, x, y, z = q.unbind(-1)
+    return torch.stack([w, -x, -y, -z], dim=-1)
 
 
-# --- 1. 線速度 / 角速度追蹤 ---
-def lin_vel_tracking_reward(
-    commands: torch.Tensor, root_lin_vel_b: torch.Tensor, std: float, scale: float
-) -> torch.Tensor:
-    error = torch.sum(torch.square(commands[:, :2] - root_lin_vel_b[:, :2]), dim=1)
-    return exp_kernel(error, std) * scale
+def quat_dist(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    """兩個四元數的「距離」: 1 - <q1,q2>^2, 值域 [0,1]。
+
+    對小夾角來說約等於 sin^2(angle/2) ≈ (angle/2)^2, 是 wrap-safe 的角度誤差度量,
+    這也是論文公式裡係數(5 / 300 / 30)偏大的原因 —— 係數乘的是這個「小量」, 不是
+    直接乘弧度角。
+    """
+    dot = torch.sum(q1 * q2, dim=-1)
+    return 1.0 - dot * dot
 
 
-def ang_vel_tracking_reward(
-    commands: torch.Tensor, root_ang_vel_b: torch.Tensor, std: float, scale: float
-) -> torch.Tensor:
-    error = torch.square(commands[:, 2] - root_ang_vel_b[:, 2])
-    return exp_kernel(error, std) * scale
+def yaw_twist_quat(q: torch.Tensor) -> torch.Tensor:
+    """從姿態四元數 q 取出繞世界 +z 軸的 yaw(twist)分量(swing-twist 分解)。"""
+    w, x, y, z = q.unbind(-1)
+    twist = torch.stack([w, torch.zeros_like(x), torch.zeros_like(y), z], dim=-1)
+    norm = torch.linalg.norm(twist, dim=-1, keepdim=True).clamp_min(1e-6)
+    return twist / norm
 
 
-# --- 2. 腳掌高度追蹤 ---
-def foot_height_tracking_reward(
-    feet_pos_z: torch.Tensor,
-    origin_height: float,
-    gait_phase: torch.Tensor,
-    swing_height: float,
-    sigma: float,
+def swing_quat(q: torch.Tensor) -> torch.Tensor:
+    """從姿態四元數 q 取出「去掉 yaw 之後」的傾斜(swing)分量。"""
+    twist = yaw_twist_quat(q)
+    return quat_mul(q, quat_conjugate(twist))
+
+
+def yaw_from_quat(q: torch.Tensor) -> torch.Tensor:
+    """姿態四元數 q 的純量 yaw 角(rad), 用於算 heading error(給 obs 用, 不進 reward 公式本身)。"""
+    w, x, y, z = q.unbind(-1)
+    return torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+# --- 1. 核心指令追蹤(三項, weight 0.15 / 0.1 / 0.2) ---
+def lin_vel_xy_tracking_reward(
+    commands_xy: torch.Tensor,
+    actual_xy: torch.Tensor,
+    is_standing: torch.Tensor,
+    coeff: float,
     scale: float,
 ) -> torch.Tensor:
-    """feet_pos_z / gait_phase: shape (num_envs, 2), 欄位順序為 [left, right]。"""
-    foot_z_left = feet_pos_z[:, 0] - origin_height
-    foot_z_right = feet_pos_z[:, 1] - origin_height
-    rz_left = expected_foot_height(gait_phase[:, 0], swing_height)
-    rz_right = expected_foot_height(gait_phase[:, 1], swing_height)
-    track_error = torch.square(foot_z_left - rz_left) + torch.square(foot_z_right - rz_right)
-    return exp_kernel(track_error, sigma) * scale
+    """站立指令: exp(-coeff * ||v_xy - c_xy||)(誤差不平方); 非站立: exp(-coeff * ||v_xy - c_xy||^2)。
+
+    論文特別指出: 站立指令下如果誤差平方, exp 核在誤差很小時梯度太平, 不足以壓住
+    殘餘漂移速度, 所以站立時改用誤差不平方的版本(下降得比較快), 非站立時才平方。
+    """
+    error = torch.norm(commands_xy - actual_xy, dim=-1)
+    linear_track = torch.exp(-coeff * error)
+    squared_track = torch.exp(-coeff * error * error)
+    return torch.where(is_standing, linear_track, squared_track) * scale
 
 
-# --- 3. 預設姿態懲罰 ---
-def joint_deviation_penalty(
-    joint_pos: torch.Tensor,
-    default_joint_pos: torch.Tensor,
+def yaw_tracking_reward(base_quat: torch.Tensor, yaw_cmd: torch.Tensor, coeff: float, scale: float) -> torch.Tensor:
+    """exp(-coeff * quat_dist(yaw, c_yaw)); yaw 用 swing-twist 分解取出的純 yaw 四元數比較。"""
+    twist = yaw_twist_quat(base_quat)
+    half = 0.5 * yaw_cmd
+    cmd_twist = torch.stack(
+        [torch.cos(half), torch.zeros_like(half), torch.zeros_like(half), torch.sin(half)], dim=-1
+    )
+    return torch.exp(-coeff * quat_dist(twist, cmd_twist)) * scale
+
+
+def roll_pitch_tracking_reward(base_quat: torch.Tensor, coeff: float, scale: float) -> torch.Tensor:
+    """exp(-coeff * quat_dist(rp, c_rp)); c_rp 固定為「直立」(identity), 不額外開放傾斜指令。"""
+    swing = swing_quat(base_quat)
+    identity = torch.zeros_like(swing)
+    identity[..., 0] = 1.0
+    return torch.exp(-coeff * quat_dist(swing, identity)) * scale
+
+
+# --- 2. 單腳接觸(取代相位時鐘, weight 0.1) ---
+def single_foot_contact_reward(has_credit: torch.Tensor, scale: float) -> torch.Tensor:
+    """has_credit 由呼叫端(env.py)算好: 非站立指令時「過去 grace period 內出現過恰好單腳
+    著地」就是 True; 站立指令時固定 True(不要求雙腳都著地 —— 論文指出這會懲罰機器人
+    被推撞時抬腳回穩的必要動作)。這裡只是套上 scale。
+    """
+    return has_credit.float() * scale
+
+
+# --- 2b. 兩腳角色對稱(補的, 不在論文原文裡) ---
+def leg_symmetry_reward(contact_frac: torch.Tensor, gate: torch.Tensor, coeff: float, scale: float) -> torch.Tensor:
+    """contact_frac: 左右腳「最近一段時間著地時間比例」的 EMA, shape (num_envs, 2 feet)。
+
+    single_foot_contact_reward 只看「當下恰好一隻腳著地」, 不管是哪一隻——固定一腳整場
+    貼地拖著走、另一腳負責所有抬腳動作, 一樣能拿到接近滿分, 完全不需要真正輪流交替步態。
+    這項懲罰兩腳著地比例差太多, 逼兩腳角色對稱; gate 通常是「非站立指令」(站立時兩腳
+    角色本來就不需要對稱)。
+    """
+    diff_sq = torch.square(contact_frac[:, 0] - contact_frac[:, 1])
+    return torch.exp(-coeff * diff_sq) * gate.float() * scale
+
+
+# --- 2c. 站立時的靜止獎勵(補的, 不在論文原文裡) ---
+def stand_still_reward(
+    joint_vel: torch.Tensor, controlled_idx: torch.Tensor, gate: torch.Tensor, coeff: float, scale: float
+) -> torch.Tensor:
+    """站立指令時, 鼓勵受控關節速度趨近 0(真正站定不動); gate 通常是 is_standing,
+    非站立指令時關閉, 不限制走路動作。
+    """
+    err_sq = torch.sum(torch.square(joint_vel[:, controlled_idx]), dim=1)
+    return torch.exp(-coeff * err_sq) * gate.float() * scale
+
+
+# --- 3a. Base height(weight 0.05) ---
+def base_height_reward(root_height: torch.Tensor, target_height: float, coeff: float, scale: float) -> torch.Tensor:
+    """exp(-coeff * |pz - c_h|), 線性誤差(不平方)。"""
+    return torch.exp(-coeff * torch.abs(root_height - target_height)) * scale
+
+
+# --- 3b. Feet air time(weight 1.0, 全套裡唯一的稀疏 reward, 故權重特別高) ---
+def feet_air_time_reward(
+    last_air_time: torch.Tensor,
+    first_contact: torch.Tensor,
+    threshold: float,
+    is_standing: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """站立指令時固定給滿分(=1); 非站立時, 觸地(first_contact)瞬間才有值, 等於
+    (該次騰空秒數 - threshold), 其餘時間是 0。
+
+    threshold 以下(步頻太快、騰空太短)會被罰負值, threshold 以上才是正獎勵 —— 用騰空
+    秒數本身「抵銷」固定罰分, 防止步頻過高。站立指令時沒有腳步事件的概念, 論文直接給
+    滿分(不是關掉/0), 跟其他「非站立才生效」的項不同, 要注意別搞混。
+    """
+    air_time = torch.sum((last_air_time - threshold) * first_contact.float(), dim=1)
+    return torch.where(is_standing, torch.ones_like(air_time), air_time) * scale
+
+
+# --- 3c. Feet orientation(weight 0.05) ---
+def feet_orientation_reward(
+    feet_gravity_xy: torch.Tensor,
+    feet_yaw_err: torch.Tensor,
+    coeff: float,
+    is_turning: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """feet_gravity_xy: 左右腳重力在各自本體座標的 xy 分量(~roll+pitch 傾角), shape
+    (num_envs, 2 feet, 2)。feet_yaw_err: 左右腳 yaw 相對軀幹 yaw 的誤差(rad,已 wrap),
+    shape (num_envs, 2 feet)。
+
+    is_turning 是「有沒有下轉向指令(|yaw_rate_cmd| > 0)」, 不是量測到的 heading error:
+    轉彎中(is_turning=True)腳掌本來就需要傾斜/外八才能轉向, 只檢查 roll+pitch(rp) 平不
+    平; 沒有轉向指令時(直走或站立), 額外要求腳掌 yaw 也要對齊軀幹朝向(rpy), 不能內外八。
+
+    註: coeff 是佔位數字(5.0), 論文原文這項的核函數係數在 OCR 掃描裡缺字看不清楚。
+    """
+    rp_err = torch.sum(torch.abs(feet_gravity_xy), dim=(-1, -2))
+    rpy_err = rp_err + torch.sum(torch.abs(feet_yaw_err), dim=-1)
+    err = torch.where(is_turning, rp_err, rpy_err)
+    return torch.exp(-coeff * err) * scale
+
+
+# --- 3d. Feet position(weight 0.05) ---
+def feet_position_reward(
+    feet_local_xy: torch.Tensor, nominal_xy: torch.Tensor, coeff: float, is_standing: torch.Tensor, scale: float
+) -> torch.Tensor:
+    """feet_local_xy / nominal_xy: 左右腳相對骨盆(pelvis-yaw 座標)的 xy 位置, shape (num_envs, 2, 2)。
+
+    只在站立指令時追蹤 exp(-coeff * |Δp|)(線性誤差), 鬆散地把腳掌拉回 nominal 站姿,
+    避免站著的時候出現腳掌打結、外八到誇張角度等怪站姿; 非站立指令固定給滿分(不是
+    關掉/0), 走路時完全不管, 讓步態自由發展。
+    """
+    err = torch.sum(torch.abs(feet_local_xy - nominal_xy), dim=(-1, -2))
+    standing_track = torch.exp(-coeff * err)
+    return torch.where(is_standing, standing_track, torch.ones_like(err)) * scale
+
+
+# --- 3e. Arm(weight 0.03, 鬆散限制, 主要防自碰撞) ---
+def arm_deviation_reward(
+    joint_pos: torch.Tensor, default_joint_pos: torch.Tensor, arm_idx: torch.Tensor, coeff: float, scale: float
+) -> torch.Tensor:
+    """exp(-coeff * ||Δθ_arm||), 範數(不平方)。"""
+    err = torch.norm((joint_pos - default_joint_pos)[:, arm_idx], dim=-1)
+    return torch.exp(-coeff * err) * scale
+
+
+# --- 3f. Base acceleration(weight 0.1, 抑制軀幹晃動) ---
+def base_acceleration_reward(lin_acc: torch.Tensor, coeff: float, scale: float) -> torch.Tensor:
+    """exp(-coeff * |b_xyz|); 只看軀幹線加速度(不含角加速度), 範數不平方。"""
+    return torch.exp(-coeff * torch.norm(lin_acc, dim=-1)) * scale
+
+
+# --- 3g. Action difference(weight 0.02) ---
+def action_diff_reward(
+    actions: torch.Tensor, previous_actions: torch.Tensor, coeff: float, scale: float
+) -> torch.Tensor:
+    """exp(-coeff * ||Δa||), 範數(不平方)。"""
+    err = torch.norm(actions - previous_actions, dim=-1)
+    return torch.exp(-coeff * err) * scale
+
+
+# --- 3h. Torque(weight 0.02, 抑制扭矩使用) ---
+def torque_reward(
+    applied_torque: torch.Tensor,
+    effort_limits: torch.Tensor,
     controlled_idx: torch.Tensor,
-    pose_weights: torch.Tensor,
+    coeff: float,
     scale: float,
 ) -> torch.Tensor:
-    pose_error = torch.square((joint_pos - default_joint_pos)[:, controlled_idx])
-    weighted_pose_error = pose_error * pose_weights[controlled_idx]
-    return torch.sum(weighted_pose_error, dim=1) * scale
-
-
-# --- 4. 腳掌相關懲罰(參考 holosoma penalty_feet_ori / penalty_close_feet_xy) ---
-def feet_orientation_penalty(feet_gravity_xy: torch.Tensor, scale: float) -> torch.Tensor:
-    """量測腳掌相對地面的平整度(pitch+roll), 不是左右腳 yaw 差。
-
-    feet_gravity_xy: 左右腳重力在各自本體座標的 xy 分量, shape (num_envs, 2 feet, 2)。
-    每隻腳先取 xy 分量的 norm(~sin(傾斜角)), 兩腳相加。
+    """exp(-coeff * mean(|τ_motor| / τ_max)); 每顆受控馬達的扭矩先除以自己的額定上限
+    (effort_limits)做正規化, 再取平均 —— 不是直接對原始 Nm 數值取平方和, 這樣不同
+    關節群組(腿部 96.9Nm vs 手臂 47.3Nm)才不會因為量級不同而被不成比例地懲罰。
     """
-    return torch.sum(torch.norm(feet_gravity_xy, dim=-1), dim=-1) * scale
-
-
-def close_feet_xy_penalty(feet_lateral: torch.Tensor, threshold: float, scale: float) -> torch.Tensor:
-    """腳掌側向間距小於 threshold 時固定懲罰(二元, 非連續斜坡)。"""
-    return (feet_lateral < threshold).float() * scale
-
-
-# --- 5. 存活獎勵 ---
-def alive_reward(num_envs: int, device: torch.device, scale: float) -> torch.Tensor:
-    return torch.ones(num_envs, device=device) * scale
-
-
-# --- 6. 軀幹姿態懲罰(參考 holosoma penalty_orientation) ---
-def torso_orientation_penalty(torso_gravity_xy: torch.Tensor, scale: float) -> torch.Tensor:
-    """torso_gravity_xy: 軀幹重力在本體 xy 分量, shape (num_envs, 2)。"""
-    return torch.sum(torch.square(torso_gravity_xy), dim=1) * scale
-
-
-def ang_vel_xy_penalty(torso_ang_vel_xy: torch.Tensor, scale: float) -> torch.Tensor:
-    """torso_ang_vel_xy: 軀幹角速度在本體 xy 分量, shape (num_envs, 2)。"""
-    return torch.sum(torch.square(torso_ang_vel_xy), dim=1) * scale
-
-
-def torso_height_penalty(torso_height: torch.Tensor, target_height: float, scale: float) -> torch.Tensor:
-    """torso_height: 軀幹(root)世界座標 z, shape (num_envs,)。
-
-    torso_orientation_penalty 只管傾斜角度, 不管高度 —— 蹲低但軀幹依然直立時該項是 0。
-    這裡補上高度本身的追蹤, 讓「蹲低」在觸發 termination 之前就先有平滑的梯度懲罰,
-    而不是只靠 termination 這個硬門檻。target_height 建議設成單腳站立的自然高度
-    (可以印 default_root_state[:, 2] 來抓這個值), 不是 min_torso_height 那個摔倒門檻。
-    """
-    return torch.square(torso_height - target_height) * scale
-
-
-# --- 7. 動作變化率懲罰 ---
-def action_rate_penalty(actions: torch.Tensor, previous_actions: torch.Tensor, scale: float) -> torch.Tensor:
-    return torch.sum(torch.square(actions - previous_actions), dim=1) * scale
-
-
-# --- 7b. 關節速度 / 加速度懲罰(抑制關節抖動, 只看受控關節) ---
-def joint_vel_penalty(joint_vel: torch.Tensor, controlled_idx: torch.Tensor, scale: float) -> torch.Tensor:
-    return torch.sum(torch.square(joint_vel[:, controlled_idx]), dim=1) * scale
-
-
-def joint_acc_penalty(joint_acc: torch.Tensor, controlled_idx: torch.Tensor, scale: float) -> torch.Tensor:
-    return torch.sum(torch.square(joint_acc[:, controlled_idx]), dim=1) * scale
-
-
-# --- 8. 提早終止懲罰 ---
-def termination_penalty(reset_terminated: torch.Tensor, scale: float) -> torch.Tensor:
-    return reset_terminated.float() * scale
+    ratio = torch.abs(applied_torque[:, controlled_idx]) / effort_limits[:, controlled_idx]
+    return torch.exp(-coeff * torch.mean(ratio, dim=-1)) * scale

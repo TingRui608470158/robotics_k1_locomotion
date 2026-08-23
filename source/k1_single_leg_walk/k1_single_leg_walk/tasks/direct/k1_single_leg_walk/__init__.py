@@ -19,5 +19,6 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.k1_single_leg_walk_env_cfg:K1SingleLegWalkEnvCfg",
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1SingleLegWalkPPORunnerCfg",
     },
 )

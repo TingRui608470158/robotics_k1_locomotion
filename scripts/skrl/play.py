@@ -134,6 +134,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     # override configurations with non-hydra CLI arguments
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    # don't randomly shove the robot around during evaluation (that's a training-only
+    # domain-randomization feature; leaving it on makes play look like unprompted flailing)
+    if hasattr(env_cfg, "enable_random_push"):
+        env_cfg.enable_random_push = False
 
     # configure the ML framework into the global skrl variable
     if args_cli.ml_framework.startswith("jax"):

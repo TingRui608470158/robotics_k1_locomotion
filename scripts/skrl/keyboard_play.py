@@ -137,6 +137,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     # override configurations with non-hydra CLI arguments
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    # don't randomly shove the robot around during interactive teleop (that's a training-only
+    # domain-randomization feature; leaving it on makes it look like unprompted flailing)
+    if hasattr(env_cfg, "enable_random_push"):
+        env_cfg.enable_random_push = False
 
     if args_cli.ml_framework.startswith("jax"):
         skrl.config.jax.backend = "jax" if args_cli.ml_framework == "jax" else "numpy"
@@ -213,9 +217,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
                 keyboard.reset()
                 should_reset = False
 
-            # update the velocity command from keyboard input before the agent acts on it
+            # update the velocity command from keyboard input before the agent acts on it.
+            # _commands[:,2] is now an absolute heading target that env.step() integrates from
+            # _yaw_rate_cmd every step (not a raw yaw rate itself), so omega_z has to go into
+            # _yaw_rate_cmd, not _commands[:,2] directly (that would just get overwritten by the
+            # integration on the very next step). We also stomp _steps_until_resample every loop
+            # iteration so the env's periodic auto-resample (every 2-6s) never fights the keyboard.
             cmd = keyboard.advance()  # (3,) = [v_x, v_y, omega_z]
-            env.unwrapped._commands[:] = cmd.repeat(env.unwrapped.num_envs, 1)
+            cmd_t = torch.as_tensor(cmd, device=env.unwrapped.device, dtype=torch.float32)
+            env.unwrapped._commands[:, :2] = cmd_t[:2].repeat(env.unwrapped.num_envs, 1)
+            env.unwrapped._yaw_rate_cmd[:] = cmd_t[2]
+            env.unwrapped._is_standing[:] = torch.all(cmd_t == 0.0)
+            env.unwrapped._steps_until_resample[:] = 1_000_000
 
             # agent stepping
             outputs = runner.agent.act(obs, states=obs, timestep=0, timesteps=0)
