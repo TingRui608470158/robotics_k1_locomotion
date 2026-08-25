@@ -14,25 +14,10 @@ from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.markers import VisualizationMarkers
 from isaaclab.markers.config import GREEN_ARROW_X_MARKER_CFG
-from isaaclab.utils.math import euler_xyz_from_quat, quat_apply_inverse, quat_from_euler_xyz
+from isaaclab.sensors import ContactSensor
+from isaaclab.utils.math import quat_from_euler_xyz
 
 from .k1_single_leg_walk_env_cfg import K1SingleLegWalkEnvCfg
-from .reward_terms import (
-    action_rate_penalty,
-    alive_reward,
-    ang_vel_tracking_reward,
-    ang_vel_xy_penalty,
-    close_feet_xy_penalty,
-    feet_orientation_penalty,
-    foot_height_tracking_reward,
-    joint_acc_penalty,
-    joint_deviation_penalty,
-    joint_vel_penalty,
-    lin_vel_tracking_reward,
-    termination_penalty,
-    torso_height_penalty,
-    torso_orientation_penalty,
-)
 
 
 class K1SingleLegWalkEnv(DirectRLEnv):
@@ -59,7 +44,6 @@ class K1SingleLegWalkEnv(DirectRLEnv):
 
         joint_names = self.robot.data.joint_names
         self._action_scale = torch.zeros(len(joint_names), device=self.device)
-        self._pose_weights = torch.zeros(len(joint_names), device=self.device)
         self._max_delta = torch.zeros(len(joint_names), device=self.device)
         for i, name in enumerate(joint_names):
             for key, (scale, delta) in self.cfg.joint_action_scale_map.items():
@@ -67,20 +51,21 @@ class K1SingleLegWalkEnv(DirectRLEnv):
                     self._action_scale[i] = scale
                     self._max_delta[i] = delta
                     break
-            for key, weight in self.cfg.pose_weights_map.items():
-                if key in name:
-                    self._pose_weights[i] = weight
-                    break
         # 找出「受控關節」的 idx
         self._controlled_idx = torch.nonzero(self._action_scale > 0).squeeze(-1)
 
-        # 找出左右腳掌對應的 body index(用於腳掌高度、朝向、間距獎勵)
-        self._feet_ids, _ = self.robot.find_bodies(".*ankle_roll_link")
-        self._ankle_ids, _ = self.robot.find_bodies(".*ankle_pitch_link")
+        # 找出左右腳掌對應的 body index(腳掌高度、水平速度、接觸偵測都用同一組 body)
+        self._feet_ids, self._feet_names = self.robot.find_bodies(".*ankle_roll_link")
 
-        # 找出軀幹(base/torso)body index，用於姿態懲罰
-        self._torso_id, _ = self.robot.find_bodies("pelvis")
-        self._gravity_vec = torch.tensor([0.0, 0.0, -1.0], device=self.device)
+        # ContactSensor 掃到的 body 順序不保證跟 find_bodies 一樣, 用名字對齊, 避免左右腳接觸力兜錯
+        self._contact_feet_idx = [self.contact_sensor.body_names.index(name) for name in self._feet_names]
+
+        # 找出左右 hip_roll 關節 idx, 給 hip_roll 內夾懲罰用。兩邊用同一個旋轉軸慣例(axis="1 0 0",
+        # 沒有鏡像), 已用 URDF joint limit 驗證方向: left 是 (-0.61, +2.53)、right 是 (-2.53, +0.61)
+        # 剛好鏡像對稱, 代表 left_hip_roll<0 / right_hip_roll>0 是「內收(往中線夾)」的方向
+        hip_roll_ids, hip_roll_names = self.robot.find_joints(".*hip_roll_joint")
+        self._left_hip_roll_idx = hip_roll_ids[[i for i, n in enumerate(hip_roll_names) if "left" in n][0]]
+        self._right_hip_roll_idx = hip_roll_ids[[i for i, n in enumerate(hip_roll_names) if "right" in n][0]]
 
         # 左右腳的步態相位，各自 shape (num_envs,)，範圍 [-pi, pi]
         # 右腳相位比左腳落後半個週期(pi)，讓兩腳自然交替
@@ -93,20 +78,17 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         self._episode_sums = {
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             for key in [
+                "stance_contact",
+                "slip",
+                "swing_height",
+                "swing_clearance",
                 "lin_vel_tracking",
                 "ang_vel_tracking",
-                "foot_height",
-                "joint_deviation",
-                "feet_ori",
-                "close_feet_xy",
                 "alive",
-                "torso_orientation",
-                "ang_vel_xy",
-                "torso_height",
                 "action_rate",
-                "joint_vel",
-                "joint_acc",
-                "termination",
+                "stand_still",
+                "torso_orientation",
+                "hip_roll_adduction",
             ]
         }
 
@@ -123,6 +105,10 @@ class K1SingleLegWalkEnv(DirectRLEnv):
             self.scene.filter_collisions(global_prim_paths=[])
         # add articulation to scene
         self.scene.articulations["robot"] = self.robot
+
+        # stance_contact_reward / slip_penalty / swing_clearance_penalty 都要靠實際接觸力
+        self.contact_sensor = ContactSensor(self.cfg.contact_sensor_cfg)
+        self.scene.sensors["contact_sensor"] = self.contact_sensor
 
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
@@ -153,7 +139,6 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         # observation 回饋中溢位成 inf/nan（實際套用到物理的量已經有 max_delta clamp，
         # 這裡是保護原始值本身，跟 skrl_ppo_cfg.yaml 的 clip_actions 是兩道防線）
         self._actions = actions.clone().clamp(-10.0, 10.0)
-        # self._actions[:] = 0.0
         default_q = self.robot.data.default_joint_pos
 
         raw_delta = self._action_scale[self._controlled_idx] * self._actions
@@ -173,8 +158,8 @@ class K1SingleLegWalkEnv(DirectRLEnv):
 
     def _get_observations(self) -> dict:
         self._previous_actions = self._actions.clone()
-        self.phase_sin = torch.sin(self._gait_phase)
-        self.phase_cos = torch.cos(self._gait_phase)
+        phase_sin = torch.sin(self._gait_phase)
+        phase_cos = torch.cos(self._gait_phase)
         obs = torch.cat(
             [
                 self.robot.data.root_lin_vel_b,  # 3
@@ -184,8 +169,8 @@ class K1SingleLegWalkEnv(DirectRLEnv):
                 (self.robot.data.joint_pos - self.robot.data.default_joint_pos)[:, self._controlled_idx],  # 23
                 self.robot.data.joint_vel[:, self._controlled_idx],  # 23
                 self._actions,  # 23
-                self.phase_sin,  # 2
-                self.phase_cos,  # 2
+                phase_sin,  # 2
+                phase_cos,  # 2
             ],
             dim=-1,
         )
@@ -195,80 +180,104 @@ class K1SingleLegWalkEnv(DirectRLEnv):
     def _get_rewards(self) -> torch.Tensor:
         self._update_velocity_markers()
 
-        # ---------- 從機器人狀態擷取各項 reward 需要的原始量(四元數 -> 純量的轉換留在這裡) ----------
-        feet_pos_z = self.robot.data.body_pos_w[:, self._ankle_ids, 2]  # (num_envs, 2)
+        # ---------- 從機器人狀態擷取各項 reward 需要的原始量 ----------
+        # 步態相位 -> 正規化 [0,1) -> 站立/擺動判斷(stance_fraction 門檻, 兩腳交替支撐)
+        gait_phase_norm = (self._gait_phase + torch.pi) / (2 * torch.pi)
+        is_stance = gait_phase_norm < self.cfg.stance_fraction  # (num_envs, 2)
+        is_swing = ~is_stance
 
-        feet_quat = self.robot.data.body_quat_w[:, self._ankle_ids]  # (N, 2, 4)
-        feet_quat_flat = feet_quat.reshape(-1, 4)  # (N*2, 4)
+        # 接觸偵測: 用 ContactSensor 的實際接觸力, 已在 __init__ 對齊成跟 self._feet_ids 一樣的左右順序
+        contact_forces = self.contact_sensor.data.net_forces_w[:, self._contact_feet_idx]  # (num_envs, 2, 3)
+        contact_detected = torch.norm(contact_forces, dim=-1) > self.cfg.contact_force_threshold  # (num_envs, 2)
 
-        # 左右腳側向間距(投影到軀幹 y 軸)
-        _, _, base_yaw = euler_xyz_from_quat(self.robot.data.root_quat_w)
-        cos_y, sin_y = torch.cos(base_yaw), torch.sin(base_yaw)
-        feet_xy = self.robot.data.body_pos_w[:, self._feet_ids, :2]
-        delta_xy = feet_xy[:, 0] - feet_xy[:, 1]
-        feet_lateral = torch.abs(cos_y * delta_xy[:, 1] - sin_y * delta_xy[:, 0])
+        # 腳掌高度(扣掉 origin_height)與擺動相的目標高度曲線(三次貝茲曲線分兩段完成「上升 -> 下降」)
+        feet_pos_z = self.robot.data.body_pos_w[:, self._feet_ids, 2] - self.cfg.origin_height  # (num_envs, 2)
 
-        # 左右腳重力在本體座標的投影(改用重力投影,避開歐拉角 wrap 問題)
-        gravity_vec = torch.tensor([0.0, 0.0, -1.0], device=self.device).expand(feet_quat_flat.shape[0], 3)
-        feet_gravity_b = quat_apply_inverse(feet_quat_flat, gravity_vec).reshape(self.num_envs, 2, 3)
+        def cubic_bezier_interpolation(y_start: torch.Tensor, y_end: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+            y_diff = y_end - y_start
+            bezier = x**3 + 3 * (x**2 * (1 - x))
+            return y_start + y_diff * bezier
 
-        # 軀幹姿態 / 角速度在本體座標的投影
-        torso_quat = self.robot.data.body_quat_w[:, self._torso_id[0]]  # (N, 4)
-        torso_gravity_b = quat_apply_inverse(torso_quat, self._gravity_vec.expand(self.num_envs, 3))
-        torso_ang_vel_w = self.robot.data.body_ang_vel_w[:, self._torso_id[0]]  # (N, 3) 世界座標
-        torso_ang_vel_b = quat_apply_inverse(torso_quat, torso_ang_vel_w)  # 轉到 torso 本體座標
+        swing_span = 1.0 - self.cfg.stance_fraction
+        t = torch.clamp((gait_phase_norm - self.cfg.stance_fraction) / swing_span, 0.0, 1.0)
+        rising = cubic_bezier_interpolation(torch.zeros_like(t), torch.full_like(t, self.cfg.swing_height), 2 * t)
+        falling = cubic_bezier_interpolation(torch.full_like(t, self.cfg.swing_height), torch.zeros_like(t), 2 * t - 1)
+        swing_target = torch.where(t <= 0.5, rising, falling)
+        foot_height_target = torch.where(is_stance, torch.zeros_like(swing_target), swing_target)
 
-        # ---------- 呼叫各項 reward/penalty 公式(都在 reward_terms.py) ----------
+        # 腳掌水平速度(滑動懲罰用)
+        foot_vel_horizontal = self.robot.data.body_lin_vel_w[:, self._feet_ids, :2]  # (num_envs, 2, 2)
+
+        # command≈0(站立指令): 目前的 command 是整個 episode 固定不變, "stand" 模式就是精確的 0,
+        # 直接判斷相等即可, 不需要額外容忍誤差
+        command_is_zero = torch.all(self._commands == 0.0, dim=1)  # (num_envs,)
+        gate = (~command_is_zero).float()  # 站立/擺動 reward 只在有移動指令時才算, 避免跟指令脫鉤
+
+        # ---------- 各項 reward/penalty 公式 ----------
+        # 1a/1b 站立相(is_stance 時, 由 gate=command!=0 蓋掉)
+        stance_correct = (contact_detected == is_stance).float() * 2.0 - 1.0
+        stance_contact = torch.sum(stance_correct, dim=1) * self.cfg.stance_contact_reward_scale
+
+        slip = torch.sum(torch.square(foot_vel_horizontal), dim=-1)
+        slip = torch.sum(slip * is_stance.float(), dim=1) * self.cfg.slip_penalty_scale
+
+        # 2a/2b 擺動相(is_swing 時, 由 gate=command!=0 蓋掉)
+        swing_height_error = torch.square(feet_pos_z - foot_height_target)
+        swing_height = torch.sum(swing_height_error * is_swing.float(), dim=1) * self.cfg.swing_height_penalty_scale
+
+        swing_clearance_violation = (is_swing & contact_detected).float()
+        swing_clearance = torch.sum(swing_clearance_violation, dim=1) * self.cfg.swing_clearance_penalty_scale
+
+        # 3/4 線速度/角速度追蹤(全程都在, 不受 gate 影響)
+        lin_vel_error = torch.sum(torch.square(self._commands[:, :2] - self.robot.data.root_lin_vel_b[:, :2]), dim=1)
+        lin_vel_tracking = (
+            torch.exp(-lin_vel_error / (self.cfg.lin_vel_std**2)) * self.cfg.lin_vel_tracking_reward_scale
+        )
+
+        ang_vel_error = torch.square(self._commands[:, 2] - self.robot.data.root_ang_vel_b[:, 2])
+        ang_vel_tracking = (
+            torch.exp(-ang_vel_error / (self.cfg.ang_vel_std**2)) * self.cfg.ang_vel_tracking_reward_scale
+        )
+
+        # 5 存活獎勵 + action rate(全程都在)
+        alive = torch.ones(self.num_envs, device=self.device) * self.cfg.alive_reward_scale
+
+        action_rate = torch.sum(torch.square(self._actions - self._previous_actions), dim=1)
+        action_rate = action_rate * self.cfg.action_rate_penalty_scale
+
+        # 6 站立指令(command≈0)專用姿態懲罰, 由 command_is_zero 蓋(跟站立/擺動的 gate 相反)
+        stand_still_error = torch.sum(
+            torch.square((self.robot.data.joint_pos - self.robot.data.default_joint_pos)[:, self._controlled_idx]),
+            dim=1,
+        )
+        stand_still = stand_still_error * self.cfg.stand_still_penalty_scale
+
+        # 7 軀幹 roll/pitch 懲罰(全程都在, 不受 gate 影響): projected_gravity 在機體座標下的
+        # xy 分量應接近 0(代表軀幹接近水平)
+        torso_orientation_error = torch.sum(torch.square(self.robot.data.projected_gravity_b[:, :2]), dim=1)
+        torso_orientation = torso_orientation_error * self.cfg.torso_orientation_penalty_scale
+
+        # 8 hip_roll 內收懲罰(全程都在, 不受 gate 影響): 腳掌朝向就算是對的, 也可能是「腿伸直、
+        # 只靠 hip_roll 把腿往中線夾」造成兩腳互撞, 腳掌朝向量不到這個, 直接管 hip_roll 本身比較
+        # 準。left_hip_roll<0 / right_hip_roll>0 是往中線夾的方向(見 __init__ 的 URDF limit 驗證),
+        # 只罰內收方向, 外展(把腳張開)不罰
+        left_hip_roll = self.robot.data.joint_pos[:, self._left_hip_roll_idx]
+        right_hip_roll = self.robot.data.joint_pos[:, self._right_hip_roll_idx]
+        hip_roll_adduction_error = torch.clamp(-left_hip_roll, min=0.0) + torch.clamp(right_hip_roll, min=0.0)
+        hip_roll_adduction = torch.square(hip_roll_adduction_error) * self.cfg.hip_roll_penalty_scale
+
         rewards = {
-            "lin_vel_tracking": lin_vel_tracking_reward(
-                self._commands,
-                self.robot.data.root_lin_vel_b,
-                self.cfg.lin_vel_std,
-                self.cfg.lin_vel_tracking_reward_scale,
-            ),
-            "ang_vel_tracking": ang_vel_tracking_reward(
-                self._commands,
-                self.robot.data.root_ang_vel_b,
-                self.cfg.ang_vel_std,
-                self.cfg.ang_vel_tracking_reward_scale,
-            ),
-            "foot_height": foot_height_tracking_reward(
-                feet_pos_z,
-                self.cfg.origin_height,
-                self._gait_phase,
-                self.cfg.swing_height,
-                self.cfg.gait_tracking_sigma,
-                self.cfg.foot_height_reward_scale,
-            ),
-            "joint_deviation": joint_deviation_penalty(
-                self.robot.data.joint_pos,
-                self.robot.data.default_joint_pos,
-                self._controlled_idx,
-                self._pose_weights,
-                self.cfg.joint_deviation_penalty_scale,
-            ),
-            "feet_ori": feet_orientation_penalty(feet_gravity_b[:, :, :2], self.cfg.feet_ori_penalty_scale),
-            "close_feet_xy": close_feet_xy_penalty(
-                feet_lateral, self.cfg.close_feet_threshold, self.cfg.close_feet_xy_penalty_scale
-            ),
-            "alive": alive_reward(self.num_envs, self.device, self.cfg.alive_reward_scale),
-            "torso_orientation": torso_orientation_penalty(
-                torso_gravity_b[:, :2], self.cfg.torso_orientation_penalty_scale
-            ),
-            "ang_vel_xy": ang_vel_xy_penalty(torso_ang_vel_b[:, :2], self.cfg.ang_vel_xy_penalty_scale),
-            "torso_height": torso_height_penalty(
-                self.robot.data.root_state_w[:, 2], self.cfg.target_torso_height, self.cfg.torso_height_penalty_scale
-            ),
-            "action_rate": action_rate_penalty(
-                self._actions, self._previous_actions, self.cfg.action_rate_penalty_scale
-            ),
-            "joint_vel": joint_vel_penalty(
-                self.robot.data.joint_vel, self._controlled_idx, self.cfg.joint_vel_penalty_scale
-            ),
-            "joint_acc": joint_acc_penalty(
-                self.robot.data.joint_acc, self._controlled_idx, self.cfg.joint_acc_penalty_scale
-            ),
-            "termination": termination_penalty(self.reset_terminated, self.cfg.termination_penalty_scale),
+            "stance_contact": stance_contact * gate,
+            "slip": slip * gate,
+            "swing_height": swing_height * gate,
+            "swing_clearance": swing_clearance * gate,
+            "lin_vel_tracking": lin_vel_tracking,
+            "ang_vel_tracking": ang_vel_tracking,
+            "alive": alive,
+            "action_rate": action_rate,
+            "stand_still": stand_still * command_is_zero.float(),
+            "torso_orientation": torso_orientation,
+            "hip_roll_adduction": hip_roll_adduction,
         }
         rewards = {key: value * self.step_dt for key, value in rewards.items()}
 
@@ -276,6 +285,7 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         # Logging
         for key, value in rewards.items():
             self._episode_sums[key] += value
+
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -289,6 +299,35 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         terminated = fell_down | tilted_too_much
 
         return terminated, time_out
+
+    def _sample_commands(self, env_ids: torch.Tensor) -> torch.Tensor:
+        """每次 reset 從目前 cfg.command_stage 開放的模式裡均勻隨機選一種, 只讓其中一個
+        方向(vx 或 wz)非零, 其餘維持 0——避免連續 uniform 取樣三軸同時產生難學的複合指令。
+        """
+        active_modes = self.cfg.command_stage_modes[self.cfg.command_stage]
+        n = env_ids.shape[0]
+        mode_idx = torch.randint(0, len(active_modes), (n,), device=self.device)
+
+        commands = torch.zeros(n, 3, device=self.device)
+        for i, mode in enumerate(active_modes):
+            mask = mode_idx == i
+            count = int(mask.sum().item())
+            if count == 0:
+                continue
+            if mode == "stand":
+                continue  # 保持 0
+            if mode == "forward":
+                commands[mask, 0] = torch.empty(count, device=self.device).uniform_(0.0, self.cfg.max_lin_speed_x)
+            elif mode == "backward":
+                commands[mask, 0] = torch.empty(count, device=self.device).uniform_(
+                    -self.cfg.max_lin_speed_x_backward, 0.0
+                )
+            elif mode == "turn_left":
+                commands[mask, 2] = torch.empty(count, device=self.device).uniform_(0.0, self.cfg.max_ang_speed)
+            elif mode == "turn_right":
+                commands[mask, 2] = torch.empty(count, device=self.device).uniform_(-self.cfg.max_ang_speed, 0.0)
+
+        return commands
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
@@ -309,11 +348,16 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         self._actions[env_ids] = 0.0
         self._previous_actions[env_ids] = 0.0
 
-        # ------------ 指令重置 ------------
-        self._commands[env_ids] = torch.zeros_like(self._commands[env_ids]).uniform_(-1.0, 1.0)
+        # ------------ 指令重置(離散分類 + 分階段 curriculum, 見 env_cfg.py 說明) ------------
+        self._commands[env_ids] = self._sample_commands(env_ids)
 
-        self._gait_phase[env_ids, 0] = 0.0
-        self._gait_phase[env_ids, 1] = torch.pi
+        # 隨機化 reset 時的初始相位(維持左右腳 pi 的交替偏移), 避免每個 env 都固定在同一個
+        # 時間點(第 8 步左右)同時觸發「該切換到擺動相」——固定起始相位會讓所有 env 在還沒
+        # 建立任何單腳承重能力前, 就被同時要求抬腳, 是跟 reward/action 幅度無關的時序問題。
+        n = env_ids.shape[0]
+        phi0 = torch.empty(n, device=self.device).uniform_(-torch.pi, torch.pi)
+        self._gait_phase[env_ids, 0] = phi0
+        self._gait_phase[env_ids, 1] = torch.remainder(phi0 + 2 * torch.pi, 2 * torch.pi) - torch.pi
 
         # Logging
         extras = dict()
