@@ -25,7 +25,7 @@ class K1SingleLegWalkEnvCfg(DirectRLEnvCfg):
     episode_length_s = 20.0
     # - spaces definition
     action_space = 23
-    observation_space = 85
+    observation_space = 87  # +2: 指令投影到機體座標(見 k1_single_leg_walk_env.py _get_observations)
     state_space = 0
 
     # simulation
@@ -93,7 +93,7 @@ class K1SingleLegWalkEnvCfg(DirectRLEnvCfg):
         track_air_time=True,
         update_period=0.0,
     )
-    contact_force_threshold: float = 5.0  # N, 超過這個力才算「有觸地」
+    contact_force_threshold: float = 100.0  # N, 超過這個力才算「有觸地」
 
     # --- 步態相位: 標準雙足步態, 60% 站立相 / 40% 擺動相, 兩腳交替支撐 ---
     stance_fraction: float = 0.6
@@ -125,6 +125,15 @@ class K1SingleLegWalkEnvCfg(DirectRLEnvCfg):
     # hip_roll 把腿往中線夾」造成兩腳互撞, 腳掌朝向量不到這個(曾試過, 已改用這項取代), 直接管
     # hip_roll 本身比較準。只罰內收方向, 外展(把腳張開)不罰
     hip_roll_penalty_scale: float = -1.0
+    # 9 擺動腳速度追蹤(只在 is_swing 時, 且由 gate=command!=0 蓋掉): 補充 lin_vel/ang_vel_tracking
+    # (追 root 速度, 是真正的任務目標, 不能拿掉), 這項額外鼓勵擺動腳「方向對、速度跟指令等比例」
+    # ——用跟 lin_vel_tracking 一樣的 exp-kernel 對一個目標向量(方向抓指令方向, 大小抓指令速度)
+    # 算誤差, 有明確最佳解、不會無上限鼓勵甩腿(不能用「越快越好」, 會被鑽漏洞甩出不自然的步態)
+    swing_vel_tracking_reward_scale: float = 1.0
+    swing_vel_std: float = 0.5
+    # 10 朝向對齊懲罰(由 gate=command!=0 蓋掉, stand 時沒有方向可對齊): 機器人朝向(root 局部 +X
+    # 投影到世界 XY)應該對齊指令方向, 不要用側身/背對指令方向的方式走
+    heading_penalty_scale: float = -1.0
 
     # --- command: 離散分類 + 分階段 curriculum ---
     # 原本用連續 uniform 分布同時取樣 vx/vy/wz, 容易產生「三個方向都有一點點」的複合指令,
@@ -140,7 +149,7 @@ class K1SingleLegWalkEnvCfg(DirectRLEnvCfg):
     # 同一個 stage 內的模式一律等機率, 不額外做機率加權(要調的話等有需要再加)。
     # key 用字串: isaaclab 的 class_to_dict() 會假設所有 dict key 都是字串(key.startswith("__")),
     # int key 在 hydra 轉換設定時會直接噴 AttributeError。
-    command_stage: str = "1"
+    command_stage: str = "0"
     command_stage_modes: dict[str, list[str]] = field(
         default_factory=lambda: {
             "0": ["stand", "forward"],
