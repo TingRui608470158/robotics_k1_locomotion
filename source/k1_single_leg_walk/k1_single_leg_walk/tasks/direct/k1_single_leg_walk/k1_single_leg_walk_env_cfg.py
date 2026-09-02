@@ -25,7 +25,7 @@ class K1SingleLegWalkEnvCfg(DirectRLEnvCfg):
     episode_length_s = 20.0
     # - spaces definition
     action_space = 23
-    observation_space = 87  # +2: 指令投影到機體座標(見 k1_single_leg_walk_env.py _get_observations)
+    observation_space = 85
     state_space = 0
 
     # simulation
@@ -63,7 +63,7 @@ class K1SingleLegWalkEnvCfg(DirectRLEnvCfg):
     joint_action_scale_map: dict[str, tuple[float, float]] = field(
         default_factory=lambda: {
             # 腿部: 主動驅動步行, 但單腳站立支撐面小, 不能一步跳太多
-            "hip_pitch_joint": (1.0, 0.4),
+            "hip_pitch_joint": (1, 0.5),
             "hip_roll_joint": (0.3, 0.3),  # 側向, 對單腳平衡最敏感, 最保守
             "hip_yaw_joint": (0.3, 0.3),
             "knee_joint": (1.0, 0.5),
@@ -113,6 +113,10 @@ class K1SingleLegWalkEnvCfg(DirectRLEnvCfg):
     ang_vel_tracking_reward_scale: float = 1.5
     lin_vel_std: float = 0.25
     ang_vel_std: float = 0.25
+    # 11 直線方向鎖定(只在指令 wz=0 時計分, 涵蓋站立/直走/直退, 不含 stage 2 的轉彎模式): 見
+    # env.py 該項註解——ang_vel_tracking 只管瞬時角速度, 容忍區間內的殘留誤差累積一整個 episode
+    # 下來會偏移很多, 這項直接懲罰「目前朝向」偏離「reset 當下朝向」多少, 才能真正拉直路線
+    heading_drift_penalty_scale: float = -2.0
     # 5 存活獎勵 + action rate(全程都在)
     alive_reward_scale: float = 0.5
     action_rate_penalty_scale: float = -0.3
@@ -125,15 +129,19 @@ class K1SingleLegWalkEnvCfg(DirectRLEnvCfg):
     # hip_roll 把腿往中線夾」造成兩腳互撞, 腳掌朝向量不到這個(曾試過, 已改用這項取代), 直接管
     # hip_roll 本身比較準。只罰內收方向, 外展(把腳張開)不罰
     hip_roll_penalty_scale: float = -1.0
-    # 9 擺動腳速度追蹤(只在 is_swing 時, 且由 gate=command!=0 蓋掉): 補充 lin_vel/ang_vel_tracking
-    # (追 root 速度, 是真正的任務目標, 不能拿掉), 這項額外鼓勵擺動腳「方向對、速度跟指令等比例」
-    # ——用跟 lin_vel_tracking 一樣的 exp-kernel 對一個目標向量(方向抓指令方向, 大小抓指令速度)
-    # 算誤差, 有明確最佳解、不會無上限鼓勵甩腿(不能用「越快越好」, 會被鑽漏洞甩出不自然的步態)
+    # 9 擺動腳方向追蹤(只在 is_swing 時, 且由 gate=command!=0 蓋掉): 只管方向(cosine 相似度,
+    # -1~1), 不管速度大小——原本用 exp-kernel 同時要求方向+大小貼近指令速度, 會跟 stride_length
+    # (要求跨步夠遠, 常常需要比指令速度更快)互相打架, 拿掉方向約束又會讓腳往內偏。方向跟大小
+    # 解耦後, 大小交給 stride_length 決定, 這裡只負責不讓擺動腳偏離該走的方向
     swing_vel_tracking_reward_scale: float = 1.0
-    swing_vel_std: float = 0.5
-    # 10 朝向對齊懲罰(由 gate=command!=0 蓋掉, stand 時沒有方向可對齊): 機器人朝向(root 局部 +X
-    # 投影到世界 XY)應該對齊指令方向, 不要用側身/背對指令方向的方式走
-    heading_penalty_scale: float = -1.0
+    # 10 跨步長度獎勵(只在單支撐、gate=command!=0 時計分): 目前在擺動的那隻腳, 沿著指令方向
+    # 投影, 領先支撐腳的距離跟「依指令速度算出來的目標跨步」的比例, 連續、按比例給分, 範圍
+    # -1(落後支撐腳一個跨步, 擺動剛開始的起始狀態)到 +1(領先支撐腳一個跨步, 真正交叉過去)。
+    # 下限故意不卡在 0(=兩腳平行)——若卡在 0, 「還沒追上」到「追平」這一整段會是平坦 0 分、
+    # 梯度消失, 而這正好是「平行步態」卡住的操作點。目標跨步: 一個完整步態週期機身要移動
+    # |vx|*gait_cycle_time, 標準雙足交替步態一個週期邁兩步, 單步理論上該負責一半
+    stride_length_cycle_fraction: float = 0.5
+    stride_length_reward_scale: float = 2.0
 
     # --- command: 離散分類 + 分階段 curriculum ---
     # 原本用連續 uniform 分布同時取樣 vx/vy/wz, 容易產生「三個方向都有一點點」的複合指令,
@@ -146,7 +154,6 @@ class K1SingleLegWalkEnvCfg(DirectRLEnvCfg):
 
     # 訓練啟動時手動指定要用哪個 stage; 觀察訓練狀況、確認完成度夠高後, 從該 stage 的
     # checkpoint 接續訓練並手動切到下一個 stage, 不寫自動判斷/切換邏輯。
-    # 同一個 stage 內的模式一律等機率, 不額外做機率加權(要調的話等有需要再加)。
     # key 用字串: isaaclab 的 class_to_dict() 會假設所有 dict key 都是字串(key.startswith("__")),
     # int key 在 hydra 轉換設定時會直接噴 AttributeError。
     command_stage: str = "0"
@@ -154,6 +161,16 @@ class K1SingleLegWalkEnvCfg(DirectRLEnvCfg):
         default_factory=lambda: {
             "0": ["stand", "forward"],
             "1": ["stand", "forward", "backward"],
-            "2": ["stand", "forward", "backward", "turn_left", "turn_right"],
+            "2": ["stand", "forward", "backward"],
         }
     )
+    # 每個模式的取樣權重(reset 時用, 不是均等機率): stand 幾乎不會倒、一抽到就撐到滿集, 存活
+    # 時間遠長於 forward/backward——即使 reset 時三者機率一樣, 時間拉長後平行環境裡「當下正在
+    # 跑哪個模式」的佔比也會被存活時間拉偏, stand 佔比會遠超過取樣機率, 稀釋掉 forward/backward
+    # 真正需要的訓練資料量。調低 stand 權重去補償這個偏差
+    command_mode_weights: dict[str, float] = field(
+        default_factory=lambda: {"stand": 1.0, "forward": 6.0, "backward": 3.0}
+    )
+    # 是否在 forward/backward 模式上疊加 wz(弧線走法); stand 不管哪個 stage 一律 wz=0(真的站定)。
+    # 前面 stage 先練純直走, 到 stage 2 才加入邊走邊轉, 不是新增獨立的模式
+    command_stage_wz_enabled: dict[str, bool] = field(default_factory=lambda: {"0": False, "1": False, "2": True})

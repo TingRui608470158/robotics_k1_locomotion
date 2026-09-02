@@ -15,7 +15,7 @@ from isaaclab.envs import DirectRLEnv
 from isaaclab.markers import VisualizationMarkers
 from isaaclab.markers.config import GREEN_ARROW_X_MARKER_CFG
 from isaaclab.sensors import ContactSensor
-from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_from_euler_xyz
+from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, quat_from_euler_xyz, wrap_to_pi
 
 from .k1_single_leg_walk_env_cfg import K1SingleLegWalkEnvCfg
 
@@ -41,6 +41,8 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         self._actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
         self._previous_actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
         self._commands = torch.zeros(self.num_envs, 3, device=self.device)
+        # reset 當下的朝向基準, 給 heading_drift 懲罰用(見 _get_rewards 該項說明)
+        self._initial_heading = torch.zeros(self.num_envs, device=self.device)
 
         joint_names = self.robot.data.joint_names
         self._action_scale = torch.zeros(len(joint_names), device=self.device)
@@ -67,8 +69,13 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         self._left_hip_roll_idx = hip_roll_ids[[i for i, n in enumerate(hip_roll_names) if "left" in n][0]]
         self._right_hip_roll_idx = hip_roll_ids[[i for i, n in enumerate(hip_roll_names) if "right" in n][0]]
 
-        # 軀幹 local +X = 面朝方向, 給 heading 對齊懲罰轉到世界座標用
-        self._root_forward_local = torch.tensor([1.0, 0.0, 0.0], device=self.device)
+        # hip_roll 是目前唯一左右鏡像的關節(其他關節如 hip_pitch/knee/ankle_pitch/ankle_roll
+        # 都已驗證兩邊 URDF limit 完全對稱, 沒有這個問題), 動作套用/觀測端在這之前都直接共用同一個
+        # scale/delta, 沒有處理「正值方向左右相反」——policy 對左右腳輸出類似數值時, 兩腳會被推向
+        # 不對稱的物理方向(例如都輸出正值, 左腳外展、右腳卻內收)。這裡把右腳 hip_roll 的動作/觀測
+        # 都乘 -1 校正, 讓兩邊「正值 action」都對應同一個物理方向(外展), 跟左腳一致
+        self._action_sign = torch.ones(len(joint_names), device=self.device)
+        self._action_sign[self._right_hip_roll_idx] = -1.0
 
         # 左右腳的步態相位，各自 shape (num_envs,)，範圍 [-pi, pi]
         # 右腳相位比左腳落後半個週期(pi)，讓兩腳自然交替
@@ -93,7 +100,8 @@ class K1SingleLegWalkEnv(DirectRLEnv):
                 "stand_still",
                 "torso_orientation",
                 "hip_roll_adduction",
-                "heading",
+                "stride_length",
+                "heading_drift",
             ]
         }
 
@@ -128,8 +136,10 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         base_pos[:, 2] += 0.5  # 抬高 0.5m，避免跟機器人本體重疊
 
         # ---------- 目標速度箭頭 ----------
-        # 指令是 (vx, vy, yaw_rate)，這裡只取 x-y 平面方向
-        goal_vel_xy = self._commands[:, :2]
+        # 指令是 (vx, vy, yaw_rate), vx/vy 是機體座標(相對目前朝向), 這裡只取 x-y 平面方向,
+        # 要先轉到世界座標箭頭才會跟著機器人朝向轉
+        cmd_lin_w = torch.cat([self._commands[:, :2], torch.zeros_like(self._commands[:, :1])], dim=-1)
+        goal_vel_xy = quat_apply(self.robot.data.root_quat_w, cmd_lin_w)[:, :2]
         goal_speed = torch.norm(goal_vel_xy, dim=-1)
         goal_heading = torch.atan2(goal_vel_xy[:, 1], goal_vel_xy[:, 0])
 
@@ -146,7 +156,8 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         self._actions = actions.clone().clamp(-10.0, 10.0)
         default_q = self.robot.data.default_joint_pos
 
-        raw_delta = self._action_scale[self._controlled_idx] * self._actions
+        # _action_sign 校正 hip_roll 左右鏡像的問題(見 __init__ 說明), 其餘關節都是 1.0 不影響
+        raw_delta = self._action_scale[self._controlled_idx] * self._action_sign[self._controlled_idx] * self._actions
         clipped_delta = torch.clamp(
             raw_delta,
             -self._max_delta[self._controlled_idx],
@@ -165,25 +176,20 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         self._previous_actions = self._actions.clone()
         phase_sin = torch.sin(self._gait_phase)
         phase_cos = torch.cos(self._gait_phase)
-
-        # self._commands 現在是世界座標的目標(見 _get_rewards 說明), policy 自己感知不到世界朝向
-        # (projected_gravity_b 對 yaw 不敏感), 額外把指令投影到機體座標當觀測, 讓 policy 有「以
-        # 目前朝向來看, 目標在哪個方向」這個可以直接拿來行動的資訊
-        cmd_lin_w = torch.cat([self._commands[:, :2], torch.zeros_like(self._commands[:, :1])], dim=-1)
-        cmd_lin_b = quat_apply_inverse(self.robot.data.root_quat_w, cmd_lin_w)[:, :2]
-
         obs = torch.cat(
             [
                 self.robot.data.root_lin_vel_b,  # 3
                 self.robot.data.root_ang_vel_b,  # 3
                 self.robot.data.projected_gravity_b,  # 3
-                self._commands,  # 3
-                (self.robot.data.joint_pos - self.robot.data.default_joint_pos)[:, self._controlled_idx],  # 23
-                self.robot.data.joint_vel[:, self._controlled_idx],  # 23
+                self._commands,  # 3, vx 是機體座標(相對目前朝向), wz 是世界座標角速度, 見 _get_rewards
+                # _action_sign 校正 hip_roll 左右鏡像(見 __init__ 說明), 讓左右腳的關節偏移/角速度
+                # 觀測值方向意義一致, 其餘關節都是 1.0 不影響
+                (self.robot.data.joint_pos - self.robot.data.default_joint_pos)[:, self._controlled_idx]
+                * self._action_sign[self._controlled_idx],  # 23
+                self.robot.data.joint_vel[:, self._controlled_idx] * self._action_sign[self._controlled_idx],  # 23
                 self._actions,  # 23
                 phase_sin,  # 2
                 phase_cos,  # 2
-                cmd_lin_b,  # 2
             ],
             dim=-1,
         )
@@ -241,27 +247,40 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         swing_clearance_violation = (is_swing & contact_detected).float()
         swing_clearance = torch.sum(swing_clearance_violation, dim=1) * self.cfg.swing_clearance_penalty_scale
 
-        # 3/4 線速度/角速度追蹤(全程都在, 不受 gate 影響): 用世界座標(root_lin_vel_w/root_ang_vel_w),
-        # 不是機體座標——body frame 只看得出「相對自己目前朝向有沒有在前進」, 看不出整體路徑有沒有
-        # 慢慢偏航/繞圈走, 世界座標才抓得到這種漂移。self._commands 現在定義成世界座標的目標
-        lin_vel_error = torch.sum(torch.square(self._commands[:, :2] - self.robot.data.root_lin_vel_w[:, :2]), dim=1)
+        # 3 線速度追蹤(全程都在, 不受 gate 影響): vx 是機體座標(相對目前朝向前進/後退), 直接跟
+        # root_lin_vel_b 比——這樣目標方向會跟著機器人目前朝向走, 不會跟 wz(見下面)打架
+        lin_vel_error = torch.sum(torch.square(self._commands[:, :2] - self.robot.data.root_lin_vel_b[:, :2]), dim=1)
         lin_vel_tracking = (
             torch.exp(-lin_vel_error / (self.cfg.lin_vel_std**2)) * self.cfg.lin_vel_tracking_reward_scale
         )
 
+        # 4 角速度追蹤(全程都在, 不受 gate 影響): wz 用世界座標(root_ang_vel_w)——「轉彎速度」該
+        # 是相對地面的朝向變化速度, 不該受機器人瞬間 roll/pitch 傾斜影響機體座標的量測結果
         ang_vel_error = torch.square(self._commands[:, 2] - self.robot.data.root_ang_vel_w[:, 2])
         ang_vel_tracking = (
             torch.exp(-ang_vel_error / (self.cfg.ang_vel_std**2)) * self.cfg.ang_vel_tracking_reward_scale
         )
 
-        # 9 擺動腳速度追蹤(只在 is_swing 時, 由 gate=command!=0 蓋掉): 目標向量方向抓指令方向、
-        # 大小抓指令速度, 跟 lin_vel_tracking 同樣用 exp-kernel, 有界、有明確最佳解(不是越快越好)。
-        # self._commands 跟 foot_vel_horizontal 現在都是世界座標, 直接比較, 不用再轉機體座標
-        cmd_lin = self._commands[:, :2]
-        target_foot_vel = cmd_lin.unsqueeze(1).expand(-1, 2, -1)  # (num_envs, 2, 2), 兩腳目標一樣
-        swing_vel_error = torch.sum(torch.square(foot_vel_horizontal - target_foot_vel), dim=-1)  # (num_envs, 2)
-        swing_vel_tracking = torch.exp(-swing_vel_error / (self.cfg.swing_vel_std**2)) * is_swing.float()
-        swing_vel_tracking = torch.sum(swing_vel_tracking, dim=1) * self.cfg.swing_vel_tracking_reward_scale
+        # 11 直線方向鎖定(只在指令 wz=0 時計分, 涵蓋站立/直走/直退, 不含 stage 2 的轉彎模式):
+        # ang_vel_tracking 只管瞬時角速度趨近 0, exp-kernel 容忍區間內殘留一點點角速度誤差幾乎不
+        # 扣分, 但這種殘留誤差如果持續存在, 累積一整個 episode(20s)下來偏移量會很可觀(例如殘留
+        # 0.1 rad/s 沒被抓到, 20 秒就轉了 2 rad, 約 115 度)——用 reset 當下的朝向當基準, 直接懲罰
+        # 目前朝向偏離基準朝向多少(累積偏移, 不是瞬時角速度), 才能真正把路線拉直
+        current_heading = euler_xyz_from_quat(self.robot.data.root_quat_w)[2]
+        heading_error = wrap_to_pi(current_heading - self._initial_heading)
+        heading_drift = torch.square(heading_error) * self.cfg.heading_drift_penalty_scale
+        wz_command_is_zero = self._commands[:, 2] == 0.0
+        heading_drift = heading_drift * wz_command_is_zero.float()
+
+        # 9 擺動腳方向追蹤(只在 is_swing 時, 由 gate=command!=0 蓋掉): 只管方向(cosine 相似度,
+        # -1~1), 不管速度大小, 見 cfg 該項註解。cmd 是機體座標, foot_vel_horizontal 是世界座標
+        # (body_lin_vel_w), 要先把 cmd 轉到世界座標才能比較
+        cmd_lin_w = torch.cat([self._commands[:, :2], torch.zeros_like(self._commands[:, :1])], dim=-1)
+        cmd_dir_w = torch.nn.functional.normalize(quat_apply(self.robot.data.root_quat_w, cmd_lin_w)[:, :2], dim=-1)
+        foot_vel_dir = torch.nn.functional.normalize(foot_vel_horizontal, dim=-1)  # (num_envs, 2, 2)
+        swing_dir_alignment = torch.sum(foot_vel_dir * cmd_dir_w.unsqueeze(1), dim=-1)  # (num_envs, 2)
+        swing_vel_tracking = torch.sum(swing_dir_alignment * is_swing.float(), dim=1)
+        swing_vel_tracking = swing_vel_tracking * self.cfg.swing_vel_tracking_reward_scale
 
         # 5 存活獎勵 + action rate(全程都在)
         alive = torch.ones(self.num_envs, device=self.device) * self.cfg.alive_reward_scale
@@ -290,13 +309,31 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         hip_roll_adduction_error = torch.clamp(-left_hip_roll, min=0.0) + torch.clamp(right_hip_roll, min=0.0)
         hip_roll_adduction = torch.square(hip_roll_adduction_error) * self.cfg.hip_roll_penalty_scale
 
-        # 10 朝向對齊懲罰(由 gate=command!=0 蓋掉, stand 時沒有方向可對齊): 機器人朝向(root 局部
-        # +X 投影到世界 XY)應該對齊指令方向, 不要用側身/背對指令方向的方式走
-        root_forward_w = quat_apply(self.robot.data.root_quat_w, self._root_forward_local.expand(self.num_envs, 3))
-        root_forward_xy = torch.nn.functional.normalize(root_forward_w[:, :2], dim=-1)
-        cmd_dir_xy = torch.nn.functional.normalize(self._commands[:, :2], dim=-1, eps=1e-6)
-        heading_alignment = torch.sum(root_forward_xy * cmd_dir_xy, dim=-1)  # (num_envs,), 1=完全對齊
-        heading = (1.0 - heading_alignment) * self.cfg.heading_penalty_scale
+        # 10 跨步長度獎勵(只在單支撐、gate=command!=0 時計分): 見 cfg 該項註解。把兩腳位置沿著
+        # 機體目前朝向(root_forward_xy)投影, 擺動腳領先支撐腳的距離(乘上 sign(vx) 處理前進/後退)
+        # 跟目標跨步的比例, 連續、按比例給分。下限故意不卡在 0(=兩腳平行), 而是延伸到 -1(=跟
+        # 支撐腳一樣落後): 擺動腳從落後支撐腳一個跨步開始擺動, 理論上該一路線性爬升到領先一個跨步,
+        # 若下限卡在 0, 「還沒追上」到「剛好追平」這一整段會是平坦的 0 分, 梯度消失——而這正好是
+        # 「平行步態」卡住的操作點, 沒有方向性訊號可以把 policy 推過去。下限延伸到 -1 後, 整條路徑
+        # (落後 -> 追平 -> 領先)都有連續的線性梯度, 追平本身是 0 分(中性), 不是梯度死區
+        feet_pos_xy = self.robot.data.body_pos_w[:, self._feet_ids, :2]  # (num_envs, 2, 2)
+        forward_local = torch.tensor([1.0, 0.0, 0.0], device=self.device).expand(self.num_envs, 3)
+        root_forward_xy_raw = quat_apply(self.robot.data.root_quat_w, forward_local)[:, :2]
+        root_forward_xy = torch.nn.functional.normalize(root_forward_xy_raw, dim=-1)
+        feet_proj = torch.sum(feet_pos_xy * root_forward_xy.unsqueeze(1), dim=-1)  # (num_envs, 2)
+        exactly_one_swinging = is_swing.sum(dim=1) == 1
+        swing_proj = torch.sum(feet_proj * is_swing.float(), dim=1)
+        stance_proj = torch.sum(feet_proj * is_stance.float(), dim=1)
+        stride_length_signed = (swing_proj - stance_proj) * torch.sign(self._commands[:, 0])
+        target_stride_length = (
+            torch.abs(self._commands[:, 0]) * self.cfg.gait_cycle_time * self.cfg.stride_length_cycle_fraction
+        )
+        stride_ratio = torch.where(
+            target_stride_length > 1e-6,
+            torch.clamp(stride_length_signed / (target_stride_length + 1e-6), -1.0, 1.0),
+            torch.zeros_like(stride_length_signed),
+        )
+        stride_length = stride_ratio * self.cfg.stride_length_reward_scale * exactly_one_swinging.float()
 
         rewards = {
             "stance_contact": stance_contact * gate,
@@ -305,13 +342,14 @@ class K1SingleLegWalkEnv(DirectRLEnv):
             "swing_clearance": swing_clearance * gate,
             "lin_vel_tracking": lin_vel_tracking,
             "ang_vel_tracking": ang_vel_tracking,
+            "heading_drift": heading_drift,
             "swing_vel_tracking": swing_vel_tracking * gate,
             "alive": alive,
             "action_rate": action_rate,
             "stand_still": stand_still * command_is_zero.float(),
             "torso_orientation": torso_orientation,
             "hip_roll_adduction": hip_roll_adduction,
-            "heading": heading * gate,
+            "stride_length": stride_length * gate,
         }
         rewards = {key: value * self.step_dt for key, value in rewards.items()}
 
@@ -334,45 +372,24 @@ class K1SingleLegWalkEnv(DirectRLEnv):
 
         return terminated, time_out
 
-    # def _sample_commands(self, env_ids: torch.Tensor) -> torch.Tensor:
-    #     """每次 reset 從目前 cfg.command_stage 開放的模式裡均勻隨機選一種, 只讓其中一個
-    #     方向(vx 或 wz)非零, 其餘維持 0——避免連續 uniform 取樣三軸同時產生難學的複合指令。
-    #     """
-    #     active_modes = self.cfg.command_stage_modes[self.cfg.command_stage]
-    #     n = env_ids.shape[0]
-    #     mode_idx = torch.randint(0, len(active_modes), (n,), device=self.device)
-
-    #     commands = torch.zeros(n, 3, device=self.device)
-    #     for i, mode in enumerate(active_modes):
-    #         mask = mode_idx == i
-    #         count = int(mask.sum().item())
-    #         if count == 0:
-    #             continue
-    #         if mode == "stand":
-    #             continue  # 保持 0
-    #         if mode == "forward":
-    #             commands[mask, 0] = torch.empty(count, device=self.device).uniform_(0.0, self.cfg.max_lin_speed_x)
-    #         elif mode == "backward":
-    #             commands[mask, 0] = torch.empty(count, device=self.device).uniform_(
-    #                 -self.cfg.max_lin_speed_x_backward, 0.0
-    #             )
-    #         elif mode == "turn_left":
-    #             commands[mask, 2] = torch.empty(count, device=self.device).uniform_(0.0, self.cfg.max_ang_speed)
-    #         elif mode == "turn_right":
-    #             commands[mask, 2] = torch.empty(count, device=self.device).uniform_(-self.cfg.max_ang_speed, 0.0)
-
-    #     return commands
     def _sample_commands(self, env_ids: torch.Tensor) -> torch.Tensor:
         """每次 reset:
-        1) 從目前 cfg.command_stage 開放的模式裡均勻隨機選 forward 或 backward,
-        線速度固定為 ±1.0(不再 uniform 取樣)。
-        2) 額外獨立取樣一個 wz(旋轉角速度), 與 vx 同時存在、互不互斥。
+        1) 從目前 cfg.command_stage 開放的模式裡依 cfg.command_mode_weights 加權隨機選
+        stand / forward / backward, vx 固定為 0 / +1.0 / -1.0。不是均等機率——stand 幾乎不會
+        倒、一抽到就撐到滿集, 存活時間遠長於 forward/backward, 即使 reset 時機率一樣, 平行環境
+        裡「當下正在跑哪個模式」的佔比也會被存活時間拉偏, 稀釋掉 forward/backward 真正需要的
+        訓練資料量, 所以要調低 stand 的取樣權重去補償。
+        2) 若目前 stage 開啟 wz(cfg.command_stage_wz_enabled), 只在 forward/backward 這兩個
+        真的在移動的模式上疊加一個獨立取樣的 wz, 做出邊走邊轉的弧線步態; stand 不管哪個 stage
+        一律 wz=0(真的站定), 不會變成原地旋轉。
         """
         active_modes = self.cfg.command_stage_modes[self.cfg.command_stage]
         n = env_ids.shape[0]
-        mode_idx = torch.randint(0, len(active_modes), (n,), device=self.device)
+        mode_weights = torch.tensor([self.cfg.command_mode_weights[m] for m in active_modes], device=self.device)
+        mode_idx = torch.multinomial(mode_weights, n, replacement=True)
 
         commands = torch.zeros(n, 3, device=self.device)
+        moving_mask = torch.zeros(n, dtype=torch.bool, device=self.device)
 
         # --- vx: forward / backward 定速 ---
         for i, mode in enumerate(active_modes):
@@ -381,12 +398,18 @@ class K1SingleLegWalkEnv(DirectRLEnv):
                 continue
             if mode == "forward":
                 commands[mask, 0] = 1.0
+                moving_mask |= mask
             elif mode == "backward":
                 commands[mask, 0] = -1.0
-            # 若還保留 "stand" 之類模式, vx 維持 0
+                moving_mask |= mask
+            # stand: vx 維持 0, 不算 moving
 
-        # --- wz: 獨立取樣, 與 vx 疊加而非互斥 ---
-        commands[:, 2] = torch.empty(n, device=self.device).uniform_(-self.cfg.max_ang_speed, self.cfg.max_ang_speed)
+        # --- wz: 只在目前 stage 開啟時, 疊加在真的在移動(forward/backward)的 env 上 ---
+        if self.cfg.command_stage_wz_enabled.get(self.cfg.command_stage, False) and moving_mask.any():
+            count = int(moving_mask.sum().item())
+            commands[moving_mask, 2] = torch.empty(count, device=self.device).uniform_(
+                -self.cfg.max_ang_speed, self.cfg.max_ang_speed
+            )
 
         return commands
 
@@ -397,35 +420,23 @@ class K1SingleLegWalkEnv(DirectRLEnv):
 
         super()._reset_idx(env_ids)
 
-        # ------------ 指令重置(離散分類 + 分階段 curriculum, 見 env_cfg.py 說明) ------------
-        # 要先取樣 command, 才知道 reset 姿態該面向哪個世界方向(見下面姿態重置)
-        self._commands[env_ids] = self._sample_commands(env_ids)
-
         # ------------ 姿態重置 ------------
         joint_pos = self.robot.data.default_joint_pos[env_ids]
         joint_vel = self.robot.data.default_joint_vel[env_ids]
         default_root_state = self.robot.data.default_root_state[env_ids]
         default_root_state[:, :3] += self.scene.env_origins[env_ids]
-
-        # self._commands 是世界座標指令(forward=+X, backward=-X), 但機器人永遠用同一個預設姿態
-        # reset。如果 reset 時面向不跟 command 方向一致(例如抽到 backward 卻面向 +X), 機器人得
-        # 先學會轉身 180 度才可能同時滿足 lin_vel_tracking(世界座標)+ heading(朝向對齊), 學習
-        # 起點不一致會拖慢訓練——所以 reset 時直接讓它面向 command 的世界方向, backward 面向 -X
-        yaw = torch.where(
-            self._commands[env_ids, 0] < 0,
-            torch.full_like(self._commands[env_ids, 0], torch.pi),
-            torch.zeros_like(self._commands[env_ids, 0]),
-        )
-        default_root_state[:, 3:7] = torch.stack(
-            [torch.cos(yaw / 2), torch.zeros_like(yaw), torch.zeros_like(yaw), torch.sin(yaw / 2)], dim=-1
-        )
-
         self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
+        # 記錄這次 reset 當下的朝向, 當作 heading_drift 懲罰的基準(見 _get_rewards 該項說明)
+        self._initial_heading[env_ids] = euler_xyz_from_quat(default_root_state[:, 3:7])[2]
+
         self._actions[env_ids] = 0.0
         self._previous_actions[env_ids] = 0.0
+
+        # ------------ 指令重置(離散分類 + 分階段 curriculum, 見 env_cfg.py 說明) ------------
+        self._commands[env_ids] = self._sample_commands(env_ids)
 
         # 隨機化 reset 時的初始相位(維持左右腳 pi 的交替偏移), 避免每個 env 都固定在同一個
         # 時間點(第 8 步左右)同時觸發「該切換到擺動相」——固定起始相位會讓所有 env 在還沒
