@@ -12,8 +12,27 @@ from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
-
+import isaaclab.envs.mdp as mdp
+from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import SceneEntityCfg
 from isaaclab_assets.robots.Robotics_K1 import K1_HUMANOID_CFG
+
+@configclass
+class EventCfg:
+    """Domain randomization 事件設定。"""
+
+    # 地面摩擦力隨機化：只作用在腳掌（左右腳分別獨立取樣）
+    randomize_foot_friction = EventTerm(
+        func=mdp.randomize_rigid_body_material,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*ankle_roll_link"),
+            "static_friction_range": (0.4, 1.25),
+            "dynamic_friction_range": (0.4, 1.0),
+            "restitution_range": (0.0, 0.3),
+            "num_buckets": 64,
+        },
+    )
 
 
 @configclass
@@ -36,6 +55,9 @@ class K1SingleLegWalkEnvCfg(DirectRLEnvCfg):
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=512, env_spacing=4.0, replicate_physics=True)
+
+    # domain randomization
+    events: EventCfg = EventCfg()
 
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
@@ -118,13 +140,13 @@ class K1SingleLegWalkEnvCfg(DirectRLEnvCfg):
     # 下來會偏移很多, 這項直接懲罰「目前朝向」偏離「reset 當下朝向」多少, 才能真正拉直路線
     heading_drift_penalty_scale: float = -2.0
     # 5 存活獎勵 + action rate(全程都在)
-    alive_reward_scale: float = 0.5
+    alive_reward_scale: float = 1.0
     action_rate_penalty_scale: float = -0.3
     # 6 站立指令(command≈0)專用姿態懲罰, 由 command_is_zero 蓋(跟站立/擺動的 gate 相反)
     stand_still_penalty_scale: float = -1.0
     # 7 軀幹 roll/pitch 懲罰(全程都在, 不受 gate 影響): 直接對「傾斜」給連續梯度, 不像
     # termination 只在超過 max_torso_tilt 才有訊號, 讓 policy 在真的倒下之前就有機會被導正
-    torso_orientation_penalty_scale: float = -1.0
+    torso_orientation_penalty_scale: float = -5.0
     # 8 hip_roll 內收懲罰(全程都在, 不受 gate 影響): 腳掌朝向就算是對的, 也可能是「腿伸直、只靠
     # hip_roll 把腿往中線夾」造成兩腳互撞, 腳掌朝向量不到這個(曾試過, 已改用這項取代), 直接管
     # hip_roll 本身比較準。只罰內收方向, 外展(把腳張開)不罰
@@ -169,7 +191,7 @@ class K1SingleLegWalkEnvCfg(DirectRLEnvCfg):
     # 跑哪個模式」的佔比也會被存活時間拉偏, stand 佔比會遠超過取樣機率, 稀釋掉 forward/backward
     # 真正需要的訓練資料量。調低 stand 權重去補償這個偏差
     command_mode_weights: dict[str, float] = field(
-        default_factory=lambda: {"stand": 1.0, "forward": 6.0, "backward": 3.0}
+        default_factory=lambda: {"stand": 2.0, "forward": 5.0, "backward": 3.0}
     )
     # 是否在 forward/backward 模式上疊加 wz(弧線走法); stand 不管哪個 stage 一律 wz=0(真的站定)。
     # 前面 stage 先練純直走, 到 stage 2 才加入邊走邊轉, 不是新增獨立的模式

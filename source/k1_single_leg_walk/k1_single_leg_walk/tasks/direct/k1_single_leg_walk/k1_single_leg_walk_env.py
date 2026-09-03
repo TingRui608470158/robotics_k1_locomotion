@@ -66,6 +66,14 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         # 沒有鏡像), 已用 URDF joint limit 驗證方向: left 是 (-0.61, +2.53)、right 是 (-2.53, +0.61)
         # 剛好鏡像對稱, 代表 left_hip_roll<0 / right_hip_roll>0 是「內收(往中線夾)」的方向
         hip_roll_ids, hip_roll_names = self.robot.find_joints(".*hip_roll_joint")
+
+        # 腿部關節 index, 給 Domain Randomization 的初始關節偏移用
+        leg_joint_patterns = [
+            ".*hip_pitch_joint", ".*hip_roll_joint", ".*hip_yaw_joint", 
+            ".*knee_joint", ".*ankle_pitch_joint", ".*ankle_roll_joint",
+        ]
+        self._leg_joint_ids, _ = self.robot.find_joints(leg_joint_patterns)
+        
         self._left_hip_roll_idx = hip_roll_ids[[i for i, n in enumerate(hip_roll_names) if "left" in n][0]]
         self._right_hip_roll_idx = hip_roll_ids[[i for i, n in enumerate(hip_roll_names) if "right" in n][0]]
 
@@ -167,7 +175,15 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         self._processed_actions = default_q.clone()
         self._processed_actions[:, self._controlled_idx] = default_q[:, self._controlled_idx] + clipped_delta
 
-        self._gait_phase = torch.remainder(self._gait_phase + self._phase_dt + torch.pi, 2 * torch.pi) - torch.pi
+        # 指令是 stand(全 0)時相位不推進, 鎖在 reset 時設定的雙腳支撐相正中央(見 _reset_idx)。
+        # 步態相位不管指令是什麼原本都會持續推進, 但 stand 時所有跟步態有關的 reward 都被 gate
+        # 蓋成 0, 沒有任何訊號告訴 policy 該怎麼處理相位推進到擺動區間這件事——會讓 observation
+        # 出現「該啟步了」的訊號, 但指令卻要求站定, 兩個矛盾訊號疊加, 容易讓 policy 在站立時也
+        # 想抬腳
+        moving = (~torch.all(self._commands == 0.0, dim=1)).float().unsqueeze(-1)
+        self._gait_phase = (
+            torch.remainder(self._gait_phase + self._phase_dt * moving + torch.pi, 2 * torch.pi) - torch.pi
+        )
 
     def _apply_action(self) -> None:
         self.robot.set_joint_position_target(self._processed_actions)
@@ -233,7 +249,8 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         gate = (~command_is_zero).float()  # 站立/擺動 reward 只在有移動指令時才算, 避免跟指令脫鉤
 
         # ---------- 各項 reward/penalty 公式 ----------
-        # 1a/1b 站立相(is_stance 時, 由 gate=command!=0 蓋掉)
+        # 1a/1b 站立相(is_stance 判斷本身走路/站立都適用, 不受 gate 影響——腳有沒有踩穩地面
+        # 跟該不該交替擺動是兩件事, 站立時一樣需要腳確實接觸地面, 不該因為沒有移動指令就不管)
         stance_correct = (contact_detected == is_stance).float() * 2.0 - 1.0
         stance_contact = torch.sum(stance_correct, dim=1) * self.cfg.stance_contact_reward_scale
 
@@ -336,8 +353,8 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         stride_length = stride_ratio * self.cfg.stride_length_reward_scale * exactly_one_swinging.float()
 
         rewards = {
-            "stance_contact": stance_contact * gate,
-            "slip": slip * gate,
+            "stance_contact": stance_contact,
+            "slip": slip,
             "swing_height": swing_height * gate,
             "swing_clearance": swing_clearance * gate,
             "lin_vel_tracking": lin_vel_tracking,
@@ -421,8 +438,16 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
 
         # ------------ 姿態重置 ------------
-        joint_pos = self.robot.data.default_joint_pos[env_ids]
+        joint_pos = self.robot.data.default_joint_pos[env_ids].clone()
         joint_vel = self.robot.data.default_joint_vel[env_ids]
+
+        # --- Domain Randomization: 腿部關節初始角度加隨機偏移 ---
+        n_reset = env_ids.shape[0]
+        joint_offset = torch.empty(n_reset, len(self._leg_joint_ids), device=self.device).uniform_(-0.05, 0.05)
+        joint_pos[:, self._leg_joint_ids] += joint_offset
+        if 0 in env_ids:
+            idx = (env_ids == 0).nonzero(as_tuple=True)[0].item()
+            # print(f"[DR check] env0 leg joint offset: {joint_offset[idx].cpu().numpy()}")
         default_root_state = self.robot.data.default_root_state[env_ids]
         default_root_state[:, :3] += self.scene.env_origins[env_ids]
         self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
@@ -441,10 +466,17 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         # 隨機化 reset 時的初始相位(維持左右腳 pi 的交替偏移), 避免每個 env 都固定在同一個
         # 時間點(第 8 步左右)同時觸發「該切換到擺動相」——固定起始相位會讓所有 env 在還沒
         # 建立任何單腳承重能力前, 就被同時要求抬腳, 是跟 reward/action 幅度無關的時序問題。
+        # stand 指令(全 0)例外: 直接鎖進雙腳支撐相正中央(phase=0), 不給隨機相位, 也不讓它在
+        # _pre_physics_step 裡繼續推進(見該處說明)——沒理由讓一個「站定」的 episode 一開始
+        # 就被 observation 告知「現在該擺動」, 這種矛盾訊號是站立時還想抬腳的根源之一
         n = env_ids.shape[0]
         phi0 = torch.empty(n, device=self.device).uniform_(-torch.pi, torch.pi)
+        phase_right = torch.remainder(phi0 + 2 * torch.pi, 2 * torch.pi) - torch.pi
+        command_is_zero_reset = torch.all(self._commands[env_ids] == 0.0, dim=1)
+        phi0 = torch.where(command_is_zero_reset, torch.zeros_like(phi0), phi0)
+        phase_right = torch.where(command_is_zero_reset, torch.zeros_like(phase_right), phase_right)
         self._gait_phase[env_ids, 0] = phi0
-        self._gait_phase[env_ids, 1] = torch.remainder(phi0 + 2 * torch.pi, 2 * torch.pi) - torch.pi
+        self._gait_phase[env_ids, 1] = phase_right
 
         # Logging
         extras = dict()
