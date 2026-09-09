@@ -23,7 +23,7 @@ models:
     clip_actions: False
     network:
       - name: net
-        input: OBSERVATIONS
+        input: STATES
         layers: [512, 256, 128]
         activations: elu
     output: ONE
@@ -49,6 +49,17 @@ agent:
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
     kl_threshold: 0.008
+  # 明確寫出 observation_preprocessor, 避免觸發 skrl Runner 的舊版命名相容遷移(見
+  # skrl/utils/runner/torch/runner.py:95-107)——只寫 state_preprocessor、不寫
+  # observation_preprocessor 時, Runner 會判斷成"舊版命名"(舊版 state_preprocessor 其實
+  # 指的是現在的 observation_preprocessor), 直接把 state_preprocessor 這個 key 整個刪掉、
+  # 改名成 observation_preprocessor——結果就是 policy 的 observations 有正規化, 但 critic
+  # 的 STATES 完全沒有 state_preprocessor, 退回恆等函數(不正規化), 餵進 value network 的是
+  # 原始尺度的特權觀測(例如 contact_forces 量級到幾百牛頓), 混進其他量級 O(0.1~1) 的維度裡
+  # 沒有正規化, value function 擬合出來的估計/advantage 會失真, 這才是加任何 critic-only 欄位
+  # 都訓練不穩定的根因, 不是 obs 內容本身的問題
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: null
   state_preprocessor: RunningStandardScaler
   state_preprocessor_kwargs: null
   value_preprocessor: RunningStandardScaler

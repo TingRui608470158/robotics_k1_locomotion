@@ -57,6 +57,12 @@ parser.add_argument(
     help="The RL algorithm used for training the skrl agent.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--plot_feet", action="store_true", default=False, help="Open a live web waveform view of foot/ankle joints."
+)
+parser.add_argument("--plot_port", type=int, default=8765, help="Local port for the foot waveform web server.")
+parser.add_argument("--plot_env_idx", type=int, default=0, help="Which parallel env to plot when --plot_feet.")
+parser.add_argument("--plot_window_s", type=float, default=4.0, help="Waveform time window in seconds.")
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -81,6 +87,7 @@ import time
 import gymnasium as gym
 import skrl
 import torch
+from foot_waveform_viz import FootWaveformServer
 from packaging import version
 
 # check for minimum supported skrl version
@@ -211,7 +218,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
 
     # reset environment
     obs, _ = env.reset()
+    # asymmetric actor-critic(state_space > 0 時): critic 專用的特權觀測要另外用 env.state() 拿,
+    # 不能直接拿 obs(policy 的觀測)頂替——形狀對不上(這裡 127 vs 162), 生成的 model.compute()
+    # 不管 policy 用不用得到 states, 都會照 cfg.state_space 的形狀去 reshape, 傳錯形狀會直接噴錯
+    states = env.state()
+
+    # 腳踝/腳掌即時波形視覺化(獨立檔案 foot_waveform_viz.py, 見該檔說明), 只有 --plot_feet 才
+    # 建立跟啟動, 不影響原本沒有這個需求的用法
+    waveform_viz = (
+        FootWaveformServer(env.unwrapped, args_cli.plot_env_idx, args_cli.plot_port, args_cli.plot_window_s)
+        if args_cli.plot_feet
+        else None
+    )
+    if waveform_viz:
+        waveform_viz.start()
+
     timestep = 0
+    step_count = 0
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
@@ -219,8 +242,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
         # run everything in inference mode
         with torch.inference_mode():
             # agent stepping
-            # outputs = runner.agent.act(obs, timestep=0, timesteps=0)
-            outputs = runner.agent.act(obs, states=obs, timestep=0, timesteps=0)
+            outputs = runner.agent.act(obs, states=states, timestep=0, timesteps=0)
             # - multi-agent (deterministic) actions
             if hasattr(env, "possible_agents"):
                 actions = {a: outputs[-1][a].get("mean_actions", outputs[0][a]) for a in env.possible_agents}
@@ -229,6 +251,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
                 actions = outputs[-1].get("mean_actions", outputs[0])
             # env stepping
             obs, _, _, _, _ = env.step(actions)
+            states = env.state()
+            if waveform_viz:
+                waveform_viz.sample(step_count, dt)
+            step_count += 1
         if args_cli.video:
             timestep += 1
             # exit the play loop after recording one video
@@ -240,6 +266,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
 
+    if waveform_viz:
+        waveform_viz.stop()
     # close the simulator
     env.close()
 

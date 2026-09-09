@@ -44,8 +44,14 @@ class K1SingleLegWalkEnvCfg(DirectRLEnvCfg):
     episode_length_s = 20.0
     # - spaces definition
     action_space = 23
-    observation_space = 85
-    state_space = 0
+    # actor(policy): root_ang_vel_b(3) + projected_gravity_b(3) + commands(3) +
+    # joint_pos-default(23) + joint_pos-previous_joint_pos(23) + joint_vel(23) + joint_torque(23) +
+    # actions(23) + phase_sin(2) + heading_error(1) = 127
+    observation_space = 127
+    # critic(value, asymmetric actor-critic): actor 的全部 127 項 + root_lin_vel_b(3) +
+    # torso_height(1) + joint_vel(23, 重複列一次) + feet_height(2) + contact_forces(6) = 162,
+    # 只有 critic 看得到、訓練完就丟掉, 不用管實機拿不拿得到(見 _get_observations 說明)
+    state_space = 162
 
     # simulation
     sim: SimulationCfg = SimulationCfg(dt=1 / 200, render_interval=decimation)
@@ -123,47 +129,37 @@ class K1SingleLegWalkEnvCfg(DirectRLEnvCfg):
     gait_cycle_time: float = 0.8  # 一個完整步態週期的時間 (s)
     origin_height: float = 0.065
 
-    # --- reward scales(全新設計, 6 大類/9 項, 不是照抄舊版數值, 都是待調的起始猜測) ---
-    # 1a/1b 站立相(is_stance 時, 由 gate=command!=0 蓋掉)
+    # --- reward scales(14 項, 分 6 大類 A~F, 呼應 env.py _get_rewards() 的分類, 都是待調的
+    # 起始猜測) ---
+    # ========== A. 支撐相 (STANCE) ==========
     stance_contact_reward_scale: float = 1.0
     slip_penalty_scale: float = -1.0
-    # 2a/2b 擺動相(is_swing 時, 由 gate=command!=0 蓋掉)
+
+    # ========== B. 擺動相 (SWING) ==========
     swing_height_penalty_scale: float = -10.0
-    swing_clearance_penalty_scale: float = -2.0
-    # 3/4 線速度/角速度追蹤(全程都在, 不受 gate 影響)
+    swing_clearance_penalty_scale: float = 0.0 #-2.0
+    swing_vel_tracking_reward_scale: float = 1.0  # 只管方向不管大小, 大小交給 stride_length 決定
+    stride_length_cycle_fraction: float = 0.5
+    stride_length_reward_scale: float = 2.0  # 範圍 -1~+1, 見 env.py 該項計算
+
+    # ========== C. 指令追蹤 (VELOCITY TRACKING) ==========
     lin_vel_tracking_reward_scale: float = 2.0
-    ang_vel_tracking_reward_scale: float = 1.5
     lin_vel_std: float = 0.25
+    ang_vel_tracking_reward_scale: float = 1.5
     ang_vel_std: float = 0.25
-    # 11 直線方向鎖定(只在指令 wz=0 時計分, 涵蓋站立/直走/直退, 不含 stage 2 的轉彎模式): 見
-    # env.py 該項註解——ang_vel_tracking 只管瞬時角速度, 容忍區間內的殘留誤差累積一整個 episode
-    # 下來會偏移很多, 這項直接懲罰「目前朝向」偏離「reset 當下朝向」多少, 才能真正拉直路線
-    heading_drift_penalty_scale: float = -2.0
-    # 5 存活獎勵 + action rate(全程都在)
+    heading_drift_penalty_scale: float = -2.0  # 累積朝向偏移, 補 ang_vel_tracking 抓不到的長期漂移
+
+    # ========== D. 姿態穩定 (POSTURE) ==========
+    torso_orientation_penalty_scale: float = -5.0
+    hip_roll_penalty_scale: float = -1.0  # 只罰內收方向, 見 env.py 該項計算
+
+    # ========== E. 站立指令專用 (STAND-STILL) ==========
+    stand_still_penalty_scale: float = -1.0
+
+    # ========== F. 基礎/正則化 (BASE) ==========
     alive_reward_scale: float = 1.0
     action_rate_penalty_scale: float = -0.3
-    # 6 站立指令(command≈0)專用姿態懲罰, 由 command_is_zero 蓋(跟站立/擺動的 gate 相反)
-    stand_still_penalty_scale: float = -1.0
-    # 7 軀幹 roll/pitch 懲罰(全程都在, 不受 gate 影響): 直接對「傾斜」給連續梯度, 不像
-    # termination 只在超過 max_torso_tilt 才有訊號, 讓 policy 在真的倒下之前就有機會被導正
-    torso_orientation_penalty_scale: float = -5.0
-    # 8 hip_roll 內收懲罰(全程都在, 不受 gate 影響): 腳掌朝向就算是對的, 也可能是「腿伸直、只靠
-    # hip_roll 把腿往中線夾」造成兩腳互撞, 腳掌朝向量不到這個(曾試過, 已改用這項取代), 直接管
-    # hip_roll 本身比較準。只罰內收方向, 外展(把腳張開)不罰
-    hip_roll_penalty_scale: float = -1.0
-    # 9 擺動腳方向追蹤(只在 is_swing 時, 且由 gate=command!=0 蓋掉): 只管方向(cosine 相似度,
-    # -1~1), 不管速度大小——原本用 exp-kernel 同時要求方向+大小貼近指令速度, 會跟 stride_length
-    # (要求跨步夠遠, 常常需要比指令速度更快)互相打架, 拿掉方向約束又會讓腳往內偏。方向跟大小
-    # 解耦後, 大小交給 stride_length 決定, 這裡只負責不讓擺動腳偏離該走的方向
-    swing_vel_tracking_reward_scale: float = 1.0
-    # 10 跨步長度獎勵(只在單支撐、gate=command!=0 時計分): 目前在擺動的那隻腳, 沿著指令方向
-    # 投影, 領先支撐腳的距離跟「依指令速度算出來的目標跨步」的比例, 連續、按比例給分, 範圍
-    # -1(落後支撐腳一個跨步, 擺動剛開始的起始狀態)到 +1(領先支撐腳一個跨步, 真正交叉過去)。
-    # 下限故意不卡在 0(=兩腳平行)——若卡在 0, 「還沒追上」到「追平」這一整段會是平坦 0 分、
-    # 梯度消失, 而這正好是「平行步態」卡住的操作點。目標跨步: 一個完整步態週期機身要移動
-    # |vx|*gait_cycle_time, 標準雙足交替步態一個週期邁兩步, 單步理論上該負責一半
-    stride_length_cycle_fraction: float = 0.5
-    stride_length_reward_scale: float = 2.0
+    joint_torque_penalty_scale: float = -1.0e-4  # 抓小: 力矩平方和原始量級遠大於其他項
 
     # --- command: 離散分類 + 分階段 curriculum ---
     # 原本用連續 uniform 分布同時取樣 vx/vy/wz, 容易產生「三個方向都有一點點」的複合指令,

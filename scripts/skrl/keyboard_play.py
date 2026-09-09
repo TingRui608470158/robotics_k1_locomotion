@@ -54,6 +54,12 @@ parser.add_argument("--v_y_sensitivity", type=float, default=0.4, help="Magnitud
 parser.add_argument(
     "--omega_z_sensitivity", type=float, default=1.0, help="Magnitude of yaw rate command."
 )
+parser.add_argument(
+    "--plot_feet", action="store_true", default=False, help="Open a live web waveform view of foot/ankle joints."
+)
+parser.add_argument("--plot_port", type=int, default=8765, help="Local port for the foot waveform web server.")
+parser.add_argument("--plot_env_idx", type=int, default=0, help="Which parallel env to plot when --plot_feet.")
+parser.add_argument("--plot_window_s", type=float, default=4.0, help="Waveform time window in seconds.")
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -80,6 +86,7 @@ import gymnasium as gym
 import numpy as np
 import skrl
 import torch
+from foot_waveform_viz import FootWaveformServer
 from packaging import version
 
 # check for minimum supported skrl version
@@ -201,8 +208,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     print("\tClose the viewport window or Ctrl+C in the terminal to quit.")
 
     obs, _ = env.reset()
+    # asymmetric actor-critic(state_space > 0 時): critic 專用的特權觀測要另外用 env.state() 拿,
+    # 不能直接拿 obs(policy 的觀測)頂替——形狀對不上(這裡 127 vs 162), 見 play.py 同一處說明
+    states = env.state()
     keyboard.reset()
 
+    # 腳踝/腳掌即時波形視覺化(獨立檔案 foot_waveform_viz.py, 見該檔說明), 只有 --plot_feet 才
+    # 建立跟啟動, 不影響原本沒有這個需求的用法
+    waveform_viz = (
+        FootWaveformServer(env.unwrapped, args_cli.plot_env_idx, args_cli.plot_port, args_cli.plot_window_s)
+        if args_cli.plot_feet
+        else None
+    )
+    if waveform_viz:
+        waveform_viz.start()
+
+    step_count = 0
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
@@ -210,6 +231,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
         with torch.inference_mode():
             if should_reset:
                 obs, _ = env.reset()
+                states = env.state()
                 keyboard.reset()
                 should_reset = False
 
@@ -218,16 +240,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
             env.unwrapped._commands[:] = cmd.repeat(env.unwrapped.num_envs, 1)
 
             # agent stepping
-            outputs = runner.agent.act(obs, states=obs, timestep=0, timesteps=0)
+            outputs = runner.agent.act(obs, states=states, timestep=0, timesteps=0)
             actions = outputs[-1].get("mean_actions", outputs[0])
             # env stepping
             obs, _, _, _, _ = env.step(actions)
+            states = env.state()
+            if waveform_viz:
+                waveform_viz.sample(step_count, dt)
+            step_count += 1
 
         # keep the loop paced close to real time so keyboard input feels responsive
         sleep_time = dt - (time.time() - start_time)
         if sleep_time > 0:
             time.sleep(sleep_time)
 
+    if waveform_viz:
+        waveform_viz.stop()
     env.close()
 
 
