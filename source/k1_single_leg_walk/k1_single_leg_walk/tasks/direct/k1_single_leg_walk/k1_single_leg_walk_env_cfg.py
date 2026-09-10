@@ -18,7 +18,8 @@ from isaaclab.utils.noise import GaussianNoiseCfg, NoiseModelCfg
 import isaaclab.envs.mdp as mdp
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
-from isaaclab_assets.robots.Robotics_K1 import K1_HUMANOID_CFG
+# from isaaclab_assets.robots.Robotics_K1 import K1_HUMANOID_CFG
+from k1_single_leg_walk.assets.robots import K1_HUMANOID_CFG
 
 @configclass
 class EventCfg:
