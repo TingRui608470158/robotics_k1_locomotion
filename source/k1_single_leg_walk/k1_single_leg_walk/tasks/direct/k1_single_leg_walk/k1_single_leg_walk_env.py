@@ -41,6 +41,11 @@ class K1SingleLegWalkEnv(DirectRLEnv):
         self._actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
         self._previous_actions = torch.zeros(self.num_envs, self.cfg.action_space, device=self.device)
         self._commands = torch.zeros(self.num_envs, 3, device=self.device)
+        # 每個 env 各自倒數多久(秒)重新抽一次指令(見 _maybe_resample_commands), 各自獨立隨機
+        # 取樣, 避免全部 env 同步換指令
+        self._command_resample_time_left = torch.empty(self.num_envs, device=self.device).uniform_(
+            *self.cfg.command_resample_time_range_s
+        )
         # reset 當下的朝向基準, 給 heading_drift 懲罰用(見 _get_rewards 該項說明)
         self._initial_heading = torch.zeros(self.num_envs, device=self.device)
         # 上一次 _get_observations() 呼叫時的關節角度, 給 actor obs 的 joint_pos 一階差分用
@@ -185,6 +190,10 @@ class K1SingleLegWalkEnv(DirectRLEnv):
 
         self._processed_actions = default_q.clone()
         self._processed_actions[:, self._controlled_idx] = default_q[:, self._controlled_idx] + clipped_delta
+
+        # (啟用時)episode 中途幫每個 env 各自倒數、時間到就重新抽指令——要在讀 self._commands
+        # 之前呼叫, 這樣如果這一步剛好換了指令, 底下的相位推進/gate 判斷才會用到新指令
+        self._maybe_resample_commands()
 
         # 指令是 stand(全 0)時相位不推進, 鎖在 reset 時設定的雙腳支撐相正中央(見 _reset_idx)。
         # 步態相位不管指令是什麼原本都會持續推進, 但 stand 時所有跟步態有關的 reward 都被 gate
@@ -425,6 +434,39 @@ class K1SingleLegWalkEnv(DirectRLEnv):
 
         return terminated, time_out
 
+    def _maybe_resample_commands(self) -> None:
+        """(cfg.command_stage_resample_enabled 開啟時)不 reset 整個 episode, 只在中途幫每個
+        env 各自倒數計時、時間到就重新抽一次指令——訓練時就會遇到指令切換, 而不是只有
+        keyboard_play.py 互動操作才第一次碰到。
+        """
+        if not self.cfg.command_stage_resample_enabled.get(self.cfg.command_stage, False):
+            return
+
+        self._command_resample_time_left -= self.step_dt
+        due = self._command_resample_time_left <= 0.0
+        if not due.any():
+            return
+
+        env_ids = torch.nonzero(due).squeeze(-1)
+        self._commands[env_ids] = self._sample_commands(env_ids)
+
+        n = env_ids.shape[0]
+        self._command_resample_time_left[env_ids] = torch.empty(n, device=self.device).uniform_(
+            *self.cfg.command_resample_time_range_s
+        )
+
+        # 比照 _reset_idx 的做法: 換成 stand 指令時把相位鎖回雙支撐正中央, 不然可能凍結在
+        # 擺動相中途, 讓 stance_contact 誤判該踩地的腳沒踩地
+        now_standing = torch.all(self._commands[env_ids] == 0.0, dim=1)
+        if now_standing.any():
+            lock_ids = env_ids[now_standing]
+            self._gait_phase[lock_ids, 0] = 0.0
+            self._gait_phase[lock_ids, 1] = 0.0
+
+        # 重設朝向基準(見 heading_drift 說明): 換指令這一刻才是「該走直線」的新起點, 不該沿用
+        # 舊指令(或原始 episode reset)當下的朝向
+        self._initial_heading[env_ids] = euler_xyz_from_quat(self.robot.data.root_quat_w)[2][env_ids]
+
     def _sample_commands(self, env_ids: torch.Tensor) -> torch.Tensor:
         """每次 reset:
         1) 從目前 cfg.command_stage 開放的模式裡依 cfg.command_mode_weights 加權隨機選
@@ -502,6 +544,11 @@ class K1SingleLegWalkEnv(DirectRLEnv):
 
         # ------------ 指令重置(離散分類 + 分階段 curriculum, 見 env_cfg.py 說明) ------------
         self._commands[env_ids] = self._sample_commands(env_ids)
+        # 一併重設中途換指令的倒數計時(見 _maybe_resample_commands), 避免沿用上一個 episode
+        # 剩下的計時、reset 沒多久就又觸發一次多餘的換指令
+        self._command_resample_time_left[env_ids] = torch.empty(env_ids.shape[0], device=self.device).uniform_(
+            *self.cfg.command_resample_time_range_s
+        )
 
         # 隨機化 reset 時的初始相位(維持左右腳 pi 的交替偏移), 避免每個 env 都固定在同一個
         # 時間點(第 8 步左右)同時觸發「該切換到擺動相」——固定起始相位會讓所有 env 在還沒

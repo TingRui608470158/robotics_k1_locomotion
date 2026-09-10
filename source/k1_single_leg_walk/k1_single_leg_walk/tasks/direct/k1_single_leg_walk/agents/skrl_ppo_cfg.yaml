@@ -48,7 +48,7 @@ agent:
   learning_rate: 1.0e-3
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
-    kl_threshold: 0.008
+    kl_threshold: 0.02
   # 明確寫出 observation_preprocessor, 避免觸發 skrl Runner 的舊版命名相容遷移(見
   # skrl/utils/runner/torch/runner.py:95-107)——只寫 state_preprocessor、不寫
   # observation_preprocessor 時, Runner 會判斷成"舊版命名"(舊版 state_preprocessor 其實

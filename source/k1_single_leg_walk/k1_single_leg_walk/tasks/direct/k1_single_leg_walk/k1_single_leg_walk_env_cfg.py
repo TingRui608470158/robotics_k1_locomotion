@@ -5,6 +5,8 @@
 
 from dataclasses import field
 
+import torch
+
 import isaaclab.sim as sim_utils
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
@@ -12,6 +14,7 @@ from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
+from isaaclab.utils.noise import GaussianNoiseCfg, NoiseModelCfg
 import isaaclab.envs.mdp as mdp
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
@@ -31,6 +34,27 @@ class EventCfg:
             "dynamic_friction_range": (0.4, 1.0),
             "restitution_range": (0.0, 0.3),
             "num_buckets": 64,
+        },
+    )
+
+    # 外力推撞：每個 env 各自獨立隨機倒數(interval_range_s), 時間到就給機身一個隨機水平速度,
+    # 模擬被撞/被推——訓練 policy 學會抵抗擾動、保持平衡, 不是只會走預先排好的步態
+    push_robot: EventTerm | None = EventTerm(
+        func=mdp.push_by_setting_velocity,
+        mode="interval",
+        interval_range_s=(5.0, 8.0),
+        params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}, "asset_cfg": SceneEntityCfg("robot")},
+    )
+    # 骨盆質量隨機化(模擬製造誤差/負重變化): 官方文件建議只在初始化做一次(mode="startup"),
+    # 不要每次 reset 都跑(這個操作用 CPU tensor, 對所有 env 一次做比較划算)
+    randomize_base_mass: EventTerm | None = EventTerm(
+        func=mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="pelvis"),
+            "mass_distribution_params": (0.85, 1.15),
+            "operation": "scale",
+            "distribution": "uniform",
         },
     )
 
@@ -64,6 +88,47 @@ class K1SingleLegWalkEnvCfg(DirectRLEnvCfg):
 
     # domain randomization
     events: EventCfg = EventCfg()
+    # 每項獨立開關, 預設全部關閉, 由使用者自己決定何時開(見 __post_init__)——避免新增的 DR
+    # 默默改變目前訓練難度
+    dr_enable_push: bool = False
+    dr_enable_mass: bool = False
+    dr_enable_obs_noise: bool = False
+    # 觀測雜訊: 只在「真的像感測器讀值」的欄位上加(角速度/重力投影/關節位置差分/關節角速度/
+    # 關節力矩/朝向誤差), std 各自可調; commands/actions/phase_sin 不是感測器讀值(分別是目標值、
+    # policy 自己剛輸出的值、內部步態時鐘), 不該加雜訊, 由 __post_init__ 組 std tensor 時補 0
+    obs_noise_ang_vel_std: float = 0.05
+    obs_noise_gravity_std: float = 0.02
+    obs_noise_joint_pos_std: float = 0.01
+    obs_noise_joint_vel_std: float = 0.5
+    obs_noise_joint_torque_std: float = 1.0
+    obs_noise_heading_std: float = 0.01
+    observation_noise_model: NoiseModelCfg | None = None  # __post_init__ 依 dr_enable_obs_noise 決定要不要建
+
+    def __post_init__(self):
+        # 依開關決定要不要保留對應的 EventTerm——EventManager 看到某個 term 是 None 就會直接
+        # 跳過, 是 IsaacLab 關閉單一 DR 項目的標準做法
+        if not self.dr_enable_push:
+            self.events.push_robot = None
+        if not self.dr_enable_mass:
+            self.events.randomize_base_mass = None
+
+        if self.dr_enable_obs_noise:
+            # 跟 observation_space 上面的分段註解對齊: 3+3+3+23+23+23+23+23+2+1 = 127
+            std = torch.cat(
+                [
+                    torch.full((3,), self.obs_noise_ang_vel_std),  # root_ang_vel_b
+                    torch.full((3,), self.obs_noise_gravity_std),  # projected_gravity_b
+                    torch.zeros(3),  # commands, 不加雜訊
+                    torch.full((23,), self.obs_noise_joint_pos_std),  # joint_pos_delta_default
+                    torch.full((23,), self.obs_noise_joint_pos_std),  # joint_pos_delta_step
+                    torch.full((23,), self.obs_noise_joint_vel_std),  # joint_vel
+                    torch.full((23,), self.obs_noise_joint_torque_std),  # joint_torque
+                    torch.zeros(23),  # actions, 不加雜訊
+                    torch.zeros(2),  # phase_sin, 不加雜訊
+                    torch.full((1,), self.obs_noise_heading_std),  # heading_error
+                ]
+            )
+            self.observation_noise_model = NoiseModelCfg(noise_cfg=GaussianNoiseCfg(mean=0.0, std=std, operation="add"))
 
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
@@ -151,7 +216,7 @@ class K1SingleLegWalkEnvCfg(DirectRLEnvCfg):
 
     # ========== D. 姿態穩定 (POSTURE) ==========
     torso_orientation_penalty_scale: float = -5.0
-    hip_roll_penalty_scale: float = -1.0  # 只罰內收方向, 見 env.py 該項計算
+    hip_roll_penalty_scale: float = -10.0  # 只罰內收方向, 見 env.py 該項計算
 
     # ========== E. 站立指令專用 (STAND-STILL) ==========
     stand_still_penalty_scale: float = -1.0
@@ -192,3 +257,11 @@ class K1SingleLegWalkEnvCfg(DirectRLEnvCfg):
     # 是否在 forward/backward 模式上疊加 wz(弧線走法); stand 不管哪個 stage 一律 wz=0(真的站定)。
     # 前面 stage 先練純直走, 到 stage 2 才加入邊走邊轉, 不是新增獨立的模式
     command_stage_wz_enabled: dict[str, bool] = field(default_factory=lambda: {"0": False, "1": False, "2": True})
+    # 是否在目前 stage 開啟「episode 中途重新抽指令」(不 reset 整個 episode, 只換目標), 讓
+    # policy 在訓練時就會遇到指令切換, 而不是只有 keyboard_play.py 互動操作才第一次碰到。預設
+    # 全部關閉, 由使用者自己決定何時開, 避免默默改變目前訓練難度
+    command_stage_resample_enabled: dict[str, bool] = field(
+        default_factory=lambda: {"0": False, "1": False, "2": False}
+    )
+    # 每個 env 各自倒數多久(秒)重新抽一次指令, 各自獨立隨機取樣, 避免全部 env 同步換指令
+    command_resample_time_range_s: tuple[float, float] = (2.0, 4.0)
