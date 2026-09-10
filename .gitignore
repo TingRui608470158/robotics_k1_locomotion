@@ -73,3 +73,4 @@ tests/
 # TacSL sensor
 **/tactile_record/*
 **/gelsight_r15_data/*
+source/k1_single_leg_walk/k1_single_leg_walk/assets/ai_sapiens_description/usd/config.yaml
