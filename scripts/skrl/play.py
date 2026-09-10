@@ -91,7 +91,7 @@ from foot_waveform_viz import FootWaveformServer
 from packaging import version
 
 # check for minimum supported skrl version
-SKRL_VERSION = "1.4.3"
+SKRL_VERSION = "2.1.0"
 if version.parse(skrl.__version__) < version.parse(SKRL_VERSION):
     skrl.logger.error(
         f"Unsupported skrl version: {skrl.__version__}. "
@@ -218,6 +218,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
 
     # reset environment
     obs, _ = env.reset()
+    # asymmetric actor-critic(state_space > 0 時): critic 專用的特權觀測要另外用 env.state() 拿,
+    # 不能直接拿 obs(policy 的觀測)頂替——形狀對不上(這裡 127 vs 162), 生成的 model.compute()
+    # 不管 policy 用不用得到 states, 都會照 cfg.state_space 的形狀去 reshape, 傳錯形狀會直接噴錯
+    states = env.state()
 
     # 腳踝/腳掌即時波形視覺化(獨立檔案 foot_waveform_viz.py, 見該檔說明), 只有 --plot_feet 才
     # 建立跟啟動, 不影響原本沒有這個需求的用法
@@ -238,7 +242,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
         # run everything in inference mode
         with torch.inference_mode():
             # agent stepping
-            outputs = runner.agent.act(obs, timestep=0, timesteps=0)
+            outputs = runner.agent.act(obs, states=states, timestep=0, timesteps=0)
             # - multi-agent (deterministic) actions
             if hasattr(env, "possible_agents"):
                 actions = {a: outputs[-1][a].get("mean_actions", outputs[0][a]) for a in env.possible_agents}
@@ -247,6 +251,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
                 actions = outputs[-1].get("mean_actions", outputs[0])
             # env stepping
             obs, _, _, _, _ = env.step(actions)
+            states = env.state()
             if waveform_viz:
                 waveform_viz.sample(step_count, dt)
             step_count += 1
